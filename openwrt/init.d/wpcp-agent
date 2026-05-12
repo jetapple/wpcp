@@ -1,0 +1,98 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG="/usr/bin/wpcp-agent"
+CONFIGNAME="wpcp-agent"
+
+start_instance() {
+    local section="$1"
+
+    local enabled
+    local interface
+    local broker
+    local port
+    local username
+    local password
+    local tls
+    local cafile
+    local cert
+    local key
+    local topic_prefix
+    local obs_interval
+    local state_interval
+    local endpoint_timeout
+    local failed_timeout
+    local keepalive_active
+    local qos_control
+    local qos_observation
+    local cache_file
+    local log_level
+
+    config_get_bool enabled "$section" enabled 1
+    [ "$enabled" -eq 1 ] || return 0
+
+    config_get interface "$section" interface "wg0"
+    config_get broker "$section" broker ""
+    config_get port "$section" port "1883"
+    config_get username "$section" username ""
+    config_get password "$section" password ""
+    config_get tls "$section" tls "0"
+    config_get cafile "$section" cafile ""
+    config_get cert "$section" cert ""
+    config_get key "$section" key ""
+    config_get topic_prefix "$section" topic_prefix "wg"
+    config_get obs_interval "$section" obs_interval "45"
+    config_get state_interval "$section" state_interval "10"
+    config_get endpoint_timeout "$section" endpoint_timeout "180"
+    config_get failed_timeout "$section" failed_timeout "30"
+    config_get keepalive_active "$section" keepalive_active "25"
+    config_get qos_control "$section" qos_control "1"
+    config_get qos_observation "$section" qos_observation "0"
+    config_get cache_file "$section" cache_file ""
+    config_get log_level "$section" log_level "info"
+
+    if [ -z "$broker" ]; then
+        logger -t wpcp-agent "section=$section missing broker, skip"
+        return 0
+    fi
+
+    procd_open_instance
+    procd_set_param command "$PROG" \
+        --interface "$interface" \
+        --broker "$broker" \
+        --port "$port" \
+        --tls "$tls" \
+        --topic-prefix "$topic_prefix" \
+        --obs-interval "$obs_interval" \
+        --state-interval "$state_interval" \
+        --endpoint-timeout "$endpoint_timeout" \
+        --failed-timeout "$failed_timeout" \
+        --keepalive-active "$keepalive_active" \
+        --qos-control "$qos_control" \
+        --qos-observation "$qos_observation" \
+        --log-level "$log_level"
+
+    [ -n "$username" ] && procd_append_param command --username "$username"
+    [ -n "$password" ] && procd_append_param command --password "$password"
+    [ -n "$cafile" ] && procd_append_param command --cafile "$cafile"
+    [ -n "$cert" ] && procd_append_param command --cert "$cert"
+    [ -n "$key" ] && procd_append_param command --key "$key"
+    [ -n "$cache_file" ] && procd_append_param command --cache-file "$cache_file"
+
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+start_service() {
+    config_load "$CONFIGNAME"
+    config_foreach start_instance instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "$CONFIGNAME"
+}
