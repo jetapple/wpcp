@@ -18,7 +18,6 @@ MQTT_CAFILE=""
 MQTT_CERT=""
 MQTT_KEY=""
 TOPIC_PREFIX="wg"
-OBSERVATION_INTERVAL="25"
 STATE_INTERVAL="15"
 ENDPOINT_TIMEOUT="180"
 FAILED_TIMEOUT="30"
@@ -33,8 +32,7 @@ LOCAL_PUBLIC_KEY=""
 LOCAL_PEER_ID=""
 
 PID_CONTROL=""
-PID_OBS=""
-PID_STATE=""
+PID_SYNC=""
 
 # Function: usage
 # Purpose: Print command-line usage and option descriptions.
@@ -57,7 +55,6 @@ Optional:
       --cert PATH              TLS client cert file
       --key PATH               TLS client key file
       --topic-prefix PREFIX    MQTT topic prefix (default: $TOPIC_PREFIX)
-      --obs-interval SEC       Observation publish interval (default: $OBSERVATION_INTERVAL)
       --state-interval SEC     State reconcile interval (default: $STATE_INTERVAL)
       --endpoint-timeout SEC   Handshake freshness timeout (default: $ENDPOINT_TIMEOUT)
       --failed-timeout SEC     ACTIVATING -> FAILED timeout (default: $FAILED_TIMEOUT)
@@ -138,11 +135,6 @@ validate_args() {
     case "$QOS_OBSERVATION" in
         0|1) ;;
         *) die "--qos-observation must be 0 or 1" ;;
-    esac
-
-    case "$OBSERVATION_INTERVAL" in
-        ''|*[!0-9]*) die "--obs-interval must be integer" ;;
-        *) ;;
     esac
 
     case "$STATE_INTERVAL" in
@@ -226,10 +218,6 @@ parse_args() {
                 ;;
             --topic-prefix)
                 TOPIC_PREFIX="$2"
-                shift 2
-                ;;
-            --obs-interval)
-                OBSERVATION_INTERVAL="$2"
                 shift 2
                 ;;
             --state-interval)
@@ -540,43 +528,6 @@ cache_get_endpoint_v4() {
 cache_get_endpoint_v6() {
     pid="$1"
     cache_get_str "$pid" "endpoint_v6"
-}
-
-# Function: wg_peer_endpoint
-# Purpose: Read current endpoint for a WireGuard peer from interface state.
-# Inputs: $1 = peer public key.
-# Outputs: Echoes endpoint string if present.
-wg_peer_endpoint() {
-    pubkey="$1"
-    wg show "$WG_INTERFACE" endpoints | awk -v k="$pubkey" '$1==k {print $2; exit}'
-}
-
-# Function: wg_peer_latest_handshake
-# Purpose: Read latest handshake epoch for a peer.
-# Inputs: $1 = peer public key.
-# Outputs: Echoes handshake epoch seconds, or 0 when unavailable.
-wg_peer_latest_handshake() {
-    pubkey="$1"
-    hs="$(wg show "$WG_INTERFACE" latest-handshakes | awk -v k="$pubkey" '$1==k {print $2; exit}')"
-    if [ -z "$hs" ]; then
-        echo "0"
-    else
-        echo "$hs"
-    fi
-}
-
-# Function: wg_peer_keepalive
-# Purpose: Read persistent-keepalive value for a peer.
-# Inputs: $1 = peer public key.
-# Outputs: Echoes keepalive seconds, or off when unset.
-wg_peer_keepalive() {
-    pubkey="$1"
-    ka="$(wg show "$WG_INTERFACE" persistent-keepalive | awk -v k="$pubkey" '$1==k {print $2; exit}')"
-    if [ -z "$ka" ]; then
-        echo "off"
-    else
-        echo "$ka"
-    fi
 }
 
 # Function: mqtt_pub
@@ -891,65 +842,19 @@ ensure_local_peer_record() {
     cache_ensure_peer "$LOCAL_PEER_ID" "$LOCAL_PUBLIC_KEY" || true
 }
 
-# Function: observation_publisher_loop
-# Purpose: Periodically publish observations for all configured wg peers.
-# Inputs: Uses WG interface state and OBSERVATION_INTERVAL.
-# Outputs: Long-running loop producing MQTT observation messages.
-observation_publisher_loop() {
-    while true; do
-        ensure_local_peer_record
-
-        now_epoch="$(date +%s)"
-
-        for peer_pubkey in $(wg show "$WG_INTERFACE" peers); do
-            peer_id="$(calc_peer_id "$peer_pubkey")"
-            endpoint="$(wg_peer_endpoint "$peer_pubkey")"
-            latest_hs="$(wg_peer_latest_handshake "$peer_pubkey")"
-
-            if [ "$latest_hs" -gt 0 ]; then
-                hs_age=$((now_epoch - latest_hs))
-            else
-                hs_age=0
-            fi
-
-            cache_ensure_peer "$peer_id" "$peer_pubkey" || true
-            if [ -n "$endpoint" ] && [ "$endpoint" != "(none)" ]; then
-                cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint" "$LOCAL_PEER_ID" "$WG_INTERFACE" "$latest_hs" "$hs_age" || true
-            fi
-
-            if [ "$latest_hs" -gt 0 ] && [ "$hs_age" -lt "$ENDPOINT_TIMEOUT" ]; then
-                publish_observation_for_peer "$peer_pubkey" "$peer_id" "$endpoint" "$latest_hs" "$hs_age"
-            fi
-        done
-
-        sleep "$OBSERVATION_INTERVAL"
-    done
-}
-
 # Function: reconcile_peer_state
 # Purpose: Compute peer state machine from wg runtime data and drive activation.
-# Inputs: $1 = peer public key.
+# Inputs: $1 = peer public key, $2 = endpoint, $3 = latest_handshake, $4 = handshake_age, $5 = persistent_keepalive.
 # Outputs: Updates cache state and may trigger activate_peer.
 reconcile_peer_state() {
     peer_pubkey="$1"
+    endpoint="$2"
+    latest_hs="$3"
+    hs_age="$4"
+    keepalive="$5"
 
     now_epoch="$(date +%s)"
     peer_id="$(calc_peer_id "$peer_pubkey")"
-
-    endpoint="$(wg_peer_endpoint "$peer_pubkey")"
-    latest_hs="$(wg_peer_latest_handshake "$peer_pubkey")"
-    keepalive="$(wg_peer_keepalive "$peer_pubkey")"
-
-    if [ "$latest_hs" -gt 0 ]; then
-        hs_age=$((now_epoch - latest_hs))
-    else
-        hs_age=0
-    fi
-
-    cache_ensure_peer "$peer_id" "$peer_pubkey" || true
-    if [ -n "$endpoint" ] && [ "$endpoint" != "(none)" ]; then
-        cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint" "$LOCAL_PEER_ID" "$WG_INTERFACE" "$latest_hs" "$hs_age" || true
-    fi
 
     state="IDLE"
 
@@ -984,16 +889,40 @@ reconcile_peer_state() {
     esac
 }
 
-# Function: state_reconciler_loop
-# Purpose: Periodically reconcile state for every wg peer.
-# Inputs: Uses STATE_INTERVAL and WG interface peers list.
-# Outputs: Long-running loop that updates cache and control actions.
-state_reconciler_loop() {
+# Function: peer_sync_loop
+# Purpose: Periodically sync peer state from one wg dump, then publish observations.
+# Inputs: Uses STATE_INTERVAL and WG interface dump output.
+# Outputs: Long-running loop that updates cache, reconciles state, and publishes observation.
+peer_sync_loop() {
     while true; do
         ensure_local_peer_record
 
-        for peer_pubkey in $(wg show "$WG_INTERFACE" peers); do
-            reconcile_peer_state "$peer_pubkey"
+        now_epoch="$(date +%s)"
+
+        wg show "$WG_INTERFACE" dump | tail -n +2 | while IFS="$(printf '\t')" read -r peer_pubkey _psk endpoint _allowed latest_hs _rx _tx keepalive; do
+            [ -n "$peer_pubkey" ] || continue
+
+            peer_id="$(calc_peer_id "$peer_pubkey")"
+
+            [ -n "$latest_hs" ] || latest_hs="0"
+            [ -n "$keepalive" ] || keepalive="off"
+
+            if [ "$latest_hs" -gt 0 ]; then
+                hs_age=$((now_epoch - latest_hs))
+            else
+                hs_age=0
+            fi
+
+            cache_ensure_peer "$peer_id" "$peer_pubkey" || true
+            if [ -n "$endpoint" ] && [ "$endpoint" != "(none)" ]; then
+                cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint" "$LOCAL_PEER_ID" "$WG_INTERFACE" "$latest_hs" "$hs_age" || true
+            fi
+
+            reconcile_peer_state "$peer_pubkey" "$endpoint" "$latest_hs" "$hs_age" "$keepalive"
+
+            if [ "$latest_hs" -gt 0 ] && [ "$hs_age" -lt "$ENDPOINT_TIMEOUT" ]; then
+                publish_observation_for_peer "$peer_pubkey" "$peer_id" "$endpoint" "$latest_hs" "$hs_age"
+            fi
         done
 
         sleep "$STATE_INTERVAL"
@@ -1010,11 +939,8 @@ cleanup() {
     if [ -n "$PID_CONTROL" ]; then
         kill "$PID_CONTROL" 2>/dev/null || true
     fi
-    if [ -n "$PID_OBS" ]; then
-        kill "$PID_OBS" 2>/dev/null || true
-    fi
-    if [ -n "$PID_STATE" ]; then
-        kill "$PID_STATE" 2>/dev/null || true
+    if [ -n "$PID_SYNC" ]; then
+        kill "$PID_SYNC" 2>/dev/null || true
     fi
 
     cache_unlock
@@ -1045,15 +971,12 @@ main() {
     control_and_observation_subscriber_loop &
     PID_CONTROL="$!"
 
-    observation_publisher_loop &
-    PID_OBS="$!"
-
-    state_reconciler_loop &
-    PID_STATE="$!"
+    peer_sync_loop &
+    PID_SYNC="$!"
 
     log info "$APP_NAME started iface=$WG_INTERFACE local_peer_id=$LOCAL_PEER_ID cache=$CACHE_FILE"
 
-    wait "$PID_CONTROL" "$PID_OBS" "$PID_STATE"
+    wait "$PID_CONTROL" "$PID_SYNC"
 }
 
 main "$@"
