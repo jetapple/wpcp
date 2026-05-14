@@ -1,8 +1,9 @@
 #!/bin/sh
 
 # wg-conf-to-json.sh
-# Reads WireGuard configuration from the current system and writes
-# structured JSON to /tmp/wg.conf.json.
+# Reads WireGuard configuration from the current system and outputs
+# structured JSON to stdout by default. If -o/--output is provided,
+# JSON is written to the specified file.
 #
 # Supported platforms:
 #   - Linux:   /etc/wireguard/*.conf
@@ -24,14 +25,14 @@
 
 set -u
 
-OUTPUT_FILE="/tmp/wg.conf.json"
+OUTPUT_FILE=""
 
 usage() {
     cat <<EOF
 Usage: wg-conf-to-json.sh [options]
 
 Options:
-  -o, --output PATH   Output JSON path (default: /tmp/wg.conf.json)
+  -o, --output PATH   Output JSON path (if omitted, print JSON to stdout)
   -h, --help          Show this help and exit
 
 This script auto-detects platform and reads WireGuard peer config from:
@@ -357,11 +358,14 @@ main() {
         )
     ' "$tmp_lines")"
 
-    tmp_out="$(mktemp)"
-    printf '%s\n' "$result" > "$tmp_out"
-    mv "$tmp_out" "$OUTPUT_FILE"
-
-    printf 'written: %s\n' "$OUTPUT_FILE"
+    if [ -n "$OUTPUT_FILE" ]; then
+        tmp_out="$(mktemp)"
+        printf '%s\n' "$result" > "$tmp_out"
+        mv "$tmp_out" "$OUTPUT_FILE"
+        printf 'written: %s\n' "$OUTPUT_FILE"
+    else
+        printf '%s\n' "$result"
+    fi
 }
 
 main "$@"
