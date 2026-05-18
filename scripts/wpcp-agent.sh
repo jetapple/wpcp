@@ -22,6 +22,7 @@ STATE_INTERVAL="15"
 ENDPOINT_TIMEOUT="180"
 FAILED_TIMEOUT="30"
 KEEPALIVE_ACTIVE="25"
+EXPLICIT_ENDPOINT=""
 QOS_CONTROL="1"
 QOS_OBSERVATION="0"
 CACHE_FILE=""
@@ -59,6 +60,7 @@ Optional:
       --endpoint-timeout SEC   Handshake freshness timeout (default: $ENDPOINT_TIMEOUT)
       --failed-timeout SEC     ACTIVATING -> FAILED timeout (default: $FAILED_TIMEOUT)
       --keepalive-active SEC   Active persistent-keepalive (default: $KEEPALIVE_ACTIVE)
+    -e, --endpoint ADDR          Explicit local public endpoint (host:port or [v6]:port; use none to disable)
       --qos-control 0|1        QoS for activate/deactivate (default: $QOS_CONTROL)
       --qos-observation 0|1    QoS for observation publish (default: $QOS_OBSERVATION)
       --cache-file PATH        Cache file (default: $CACHE_FILE)
@@ -157,6 +159,13 @@ validate_args() {
         *) ;;
     esac
 
+    if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
+        endpoint_family="$(detect_endpoint_family "$EXPLICIT_ENDPOINT")"
+        if [ "$endpoint_family" != "ipv4" ] && [ "$endpoint_family" != "ipv6" ]; then
+            die "--endpoint must be host:port, [v6]:port, or none"
+        fi
+    fi
+
     if [ "$MQTT_TLS" = "1" ] && [ -n "$MQTT_CAFILE" ]; then
         [ -r "$MQTT_CAFILE" ] || die "cannot read --cafile: $MQTT_CAFILE"
     fi
@@ -234,6 +243,10 @@ parse_args() {
                 ;;
             --keepalive-active)
                 KEEPALIVE_ACTIVE="$2"
+                shift 2
+                ;;
+            -e|--endpoint)
+                EXPLICIT_ENDPOINT="$2"
                 shift 2
                 ;;
             --qos-control)
@@ -702,7 +715,7 @@ activate_peer() {
 
     cache_set_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "ACTIVATING" || true
-    #publish_control "$remote_peer_id" "activate"
+    publish_control "$remote_peer_id" "activate"
 
     log info "activate peer_id=$remote_peer_id endpoint=$endpoint reason=$reason"
     return 0
@@ -724,7 +737,7 @@ deactivate_peer() {
 
     cache_clear_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "INACTIVE" || true
-    #publish_control "$remote_peer_id" "deactivate"
+    publish_control "$remote_peer_id" "deactivate"
 
     log info "deactivate peer_id=$remote_peer_id reason=$reason"
     return 0
@@ -925,6 +938,10 @@ peer_sync_loop() {
             fi
         done
 
+        if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
+            publish_observation_for_peer "$LOCAL_PUBLIC_KEY" "$LOCAL_PEER_ID" "$EXPLICIT_ENDPOINT" "0" "0"
+        fi
+
         sleep "$STATE_INTERVAL"
     done
 }
@@ -965,6 +982,10 @@ main() {
 
     cache_init
     ensure_local_peer_record
+
+    if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
+        cache_set_endpoint "$LOCAL_PEER_ID" "$LOCAL_PUBLIC_KEY" "$EXPLICIT_ENDPOINT" "$LOCAL_PEER_ID" "$WG_INTERFACE" "0" "0" || true
+    fi
 
     trap cleanup INT TERM
 
