@@ -4,7 +4,7 @@ START=95
 STOP=10
 USE_PROCD=1
 
-PROG="/usr/bin/wpcp-agent"
+PROG="/usr/bin/wpcp-agent.sh"
 CONFIGNAME="wpcp-agent"
 
 start_instance() {
@@ -21,7 +21,8 @@ start_instance() {
     local cert
     local key
     local topic_prefix
-    local obs_interval
+    local endpoint
+    local detector
     local state_interval
     local endpoint_timeout
     local failed_timeout
@@ -44,7 +45,8 @@ start_instance() {
     config_get cert "$section" cert ""
     config_get key "$section" key ""
     config_get topic_prefix "$section" topic_prefix "wg"
-    config_get obs_interval "$section" obs_interval "45"
+    config_get endpoint "$section" endpoint ""
+    config_get detector "$section" detector ""
     config_get state_interval "$section" state_interval "10"
     config_get endpoint_timeout "$section" endpoint_timeout "180"
     config_get failed_timeout "$section" failed_timeout "30"
@@ -60,13 +62,13 @@ start_instance() {
     fi
 
     procd_open_instance
+    procd_set_param env WPCP_LOG_NO_TS=1
     procd_set_param command "$PROG" \
         --interface "$interface" \
         --broker "$broker" \
         --port "$port" \
         --tls "$tls" \
         --topic-prefix "$topic_prefix" \
-        --obs-interval "$obs_interval" \
         --state-interval "$state_interval" \
         --endpoint-timeout "$endpoint_timeout" \
         --failed-timeout "$failed_timeout" \
@@ -80,6 +82,8 @@ start_instance() {
     [ -n "$cafile" ] && procd_append_param command --cafile "$cafile"
     [ -n "$cert" ] && procd_append_param command --cert "$cert"
     [ -n "$key" ] && procd_append_param command --key "$key"
+    [ -n "$endpoint" ] && procd_append_param command --endpoint "$endpoint"
+    [ -n "$detector" ] && procd_append_param command --detector "$detector"
     [ -n "$cache_file" ] && procd_append_param command --cache-file "$cache_file"
 
     procd_set_param respawn 3600 5 5
@@ -95,4 +99,17 @@ start_service() {
 
 service_triggers() {
     procd_add_reload_trigger "$CONFIGNAME"
+}
+
+stop_service() {
+    local stale
+
+    # Defensive cleanup: kill leftover shells running the agent script.
+    stale="$(pidof wpcp-agent.sh 2>/dev/null || true)"
+    if [ -n "$stale" ]; then
+        kill $stale 2>/dev/null || true
+        sleep 1
+        stale="$(pidof wpcp-agent.sh 2>/dev/null || true)"
+        [ -n "$stale" ] && kill -9 $stale 2>/dev/null || true
+    fi
 }

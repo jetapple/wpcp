@@ -35,6 +35,7 @@ LOCAL_PEER_ID=""
 
 PID_CONTROL=""
 PID_SYNC=""
+RUNNING="1"
 
 # Function: usage
 # Purpose: Print command-line usage and option descriptions.
@@ -92,11 +93,15 @@ log_level_num() {
 log() {
     level="$1"
     shift
-    now_ts="$(date '+%Y-%m-%d %H:%M:%S')"
     cur_n="$(log_level_num "$LOG_LEVEL")"
     msg_n="$(log_level_num "$level")"
     if [ "$msg_n" -ge "$cur_n" ]; then
-        printf '%s [%s] %s\n' "$now_ts" "$level" "$*"
+        if [ "${WPCP_LOG_NO_TS:-0}" = "1" ]; then
+            printf '[%s] %s\n' "$level" "$*"
+        else
+            now_ts="$(date '+%Y-%m-%d %H:%M:%S')"
+            printf '%s [%s] %s\n' "$now_ts" "$level" "$*"
+        fi
     fi
 }
 
@@ -1003,6 +1008,8 @@ peer_sync_loop() {
 cleanup() {
     log info "stopping $APP_NAME"
 
+    RUNNING="0"
+
     if [ -n "$PID_CONTROL" ]; then
         kill "$PID_CONTROL" 2>/dev/null || true
     fi
@@ -1011,6 +1018,17 @@ cleanup() {
     fi
 
     cache_unlock
+}
+
+# Function: handle_termination
+# Purpose: Handle TERM/INT by stopping children and exiting cleanly.
+# Inputs: Signal name as $1.
+# Outputs: Performs cleanup and exits 0.
+handle_termination() {
+    sig="$1"
+    log info "received signal: $sig"
+    cleanup
+    exit 0
 }
 
 # Function: main
@@ -1037,7 +1055,8 @@ main() {
         cache_set_endpoint "$LOCAL_PEER_ID" "$LOCAL_PUBLIC_KEY" "$EXPLICIT_ENDPOINT" "$LOCAL_PEER_ID" "$WG_INTERFACE" "0" "0" || true
     fi
 
-    trap cleanup INT TERM
+    trap 'handle_termination INT' INT
+    trap 'handle_termination TERM' TERM
 
     control_and_observation_subscriber_loop &
     PID_CONTROL="$!"
@@ -1047,7 +1066,13 @@ main() {
 
     log info "$APP_NAME started iface=$WG_INTERFACE local_peer_id=$LOCAL_PEER_ID cache=$CACHE_FILE"
 
-    wait "$PID_CONTROL" "$PID_SYNC"
+    while [ "$RUNNING" = "1" ]; do
+        kill -0 "$PID_CONTROL" 2>/dev/null || break
+        kill -0 "$PID_SYNC" 2>/dev/null || break
+        sleep 1
+    done
+
+    cleanup
 }
 
 main "$@"
