@@ -28,7 +28,7 @@ QOS_OBSERVATION="0"
 CACHE_FILE=""
 CACHE_LOCK_DIR=""
 LOG_LEVEL="info"
-DETECTOR_PEER_ID=""
+DETECTOR_PEER_IDS=""
 
 LOCAL_PUBLIC_KEY=""
 LOCAL_PEER_ID=""
@@ -50,7 +50,7 @@ Required:
 
 Optional:
   -e, --endpoint ADDR          Explicit local public endpoint (host:port or [v6]:port; use none to disable)
-  -d, --detector PEER_ID       Peer to assist with endpoint detection (optional)
+  -d, --detector PEER_IDS      Peers to assist with endpoint detection, separated by ',' (optional)
   -p, --port PORT              MQTT port (default: 1883)
       --username USER          MQTT username
       --password PASS          MQTT password
@@ -268,7 +268,7 @@ parse_args() {
                 shift 2
                 ;;
             -d|--detector)
-                DETECTOR_PEER_ID="$2"
+                DETECTOR_PEER_IDS="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -428,6 +428,22 @@ detect_endpoint_family() {
     fi
 
     echo "unknown"
+}
+
+# Function: split_detector_peer_ids
+# Purpose: Split detector peer IDs by ',', trim whitespace, and ignore empty items.
+# Inputs: $1 = comma-separated detector peer IDs.
+# Outputs: Prints one normalized peer_id per line.
+split_detector_peer_ids() {
+    detector_raw="$1"
+
+    [ -n "$detector_raw" ] || return 0
+
+        printf '%s\n' "$detector_raw" | tr ',' '\n' | while IFS= read -r detector_peer_id; do
+        detector_peer_id="$(printf '%s' "$detector_peer_id" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -n "$detector_peer_id" ] || continue
+        printf '%s\n' "$detector_peer_id"
+    done
 }
 
 # Function: cache_ensure_peer
@@ -956,21 +972,24 @@ peer_sync_loop() {
             publish_observation_for_peer "$LOCAL_PUBLIC_KEY" "$LOCAL_PEER_ID" "$EXPLICIT_ENDPOINT" "0" "0"
         fi
 
-        if [ -n "$DETECTOR_PEER_ID" ]; then
-            detector_pubkey="$(cache_get_str "$DETECTOR_PEER_ID" "public_key")"
-            if [ -n "$detector_pubkey" ]; then
-                detector_state="$(cache_get_str "$DETECTOR_PEER_ID" "state")"
+        if [ -n "$DETECTOR_PEER_IDS" ]; then
+            split_detector_peer_ids "$DETECTOR_PEER_IDS" | while IFS= read -r detector_peer_id; do
+                log debug "checking detector peer_id=$detector_peer_id"
+                detector_pubkey="$(cache_get_str "$detector_peer_id" "public_key")"
+                if [ -n "$detector_pubkey" ]; then
+                    detector_state="$(cache_get_str "$detector_peer_id" "state")"
 
-                if [ -z "$detector_state" ] || [ "$detector_state" = "INACTIVE" ]  || ! wg show "$WG_INTERFACE" peers | grep -Fxq "$detector_pubkey"; then
-                    log debug "detector check: peer_id=$DETECTOR_PEER_ID state=$detector_state, activating for endpoint detection"
-                    activate_peer "$DETECTOR_PEER_ID" "$detector_pubkey" "endpoint-detection" || true
-                elif [ "$detector_state" = "CONNECTED" ] || [ "$detector_state" = "ACTIVATING" ]; then
-                    :
-                else
-                    log debug "detector check: peer_id=$DETECTOR_PEER_ID state=$detector_state, deactivating"
-                    deactivate_peer "$DETECTOR_PEER_ID" "$detector_pubkey" "endpoint-detection" || true
+                    if [ -z "$detector_state" ] || [ "$detector_state" = "INACTIVE" ]  || ! wg show "$WG_INTERFACE" peers | grep -Fxq "$detector_pubkey"; then
+                        log debug "detector check: peer_id=$detector_peer_id state=$detector_state, activating for endpoint detection"
+                        activate_peer "$detector_peer_id" "$detector_pubkey" "endpoint-detection" || true
+                    elif [ "$detector_state" = "CONNECTED" ] || [ "$detector_state" = "ACTIVATING" ]; then
+                        :
+                    else
+                        log debug "detector check: peer_id=$detector_peer_id state=$detector_state, deactivating"
+                        deactivate_peer "$detector_peer_id" "$detector_pubkey" "endpoint-detection" || true
+                    fi
                 fi
-            fi
+            done
         fi
 
         sleep "$STATE_INTERVAL"
