@@ -28,6 +28,7 @@ QOS_OBSERVATION="0"
 CACHE_FILE=""
 CACHE_LOCK_DIR=""
 LOG_LEVEL="info"
+DETECTOR_PEER_ID=""
 
 LOCAL_PUBLIC_KEY=""
 LOCAL_PEER_ID=""
@@ -48,6 +49,8 @@ Required:
   -b, --broker HOST            MQTT broker host/IP
 
 Optional:
+  -e, --endpoint ADDR          Explicit local public endpoint (host:port or [v6]:port; use none to disable)
+  -d, --detector PEER_ID       Peer to assist with endpoint detection (optional)
   -p, --port PORT              MQTT port (default: 1883)
       --username USER          MQTT username
       --password PASS          MQTT password
@@ -60,7 +63,6 @@ Optional:
       --endpoint-timeout SEC   Handshake freshness timeout (default: $ENDPOINT_TIMEOUT)
       --failed-timeout SEC     ACTIVATING -> FAILED timeout (default: $FAILED_TIMEOUT)
       --keepalive-active SEC   Active persistent-keepalive (default: $KEEPALIVE_ACTIVE)
-    -e, --endpoint ADDR          Explicit local public endpoint (host:port or [v6]:port; use none to disable)
       --qos-control 0|1        QoS for activate/deactivate (default: $QOS_CONTROL)
       --qos-observation 0|1    QoS for observation publish (default: $QOS_OBSERVATION)
       --cache-file PATH        Cache file (default: $CACHE_FILE)
@@ -263,6 +265,10 @@ parse_args() {
                 ;;
             --log-level)
                 LOG_LEVEL="$2"
+                shift 2
+                ;;
+            -d|--detector)
+                DETECTOR_PEER_ID="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -703,21 +709,27 @@ activate_peer() {
     reason="$3"
 
     endpoint="$(select_activation_endpoint "$remote_peer_id")"
-    if [ -z "$endpoint" ]; then
-        log warn "activate skipped peer_id=$remote_peer_id: no endpoint in cache"
-        return 1
-    fi
 
-    if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" endpoint "$endpoint" persistent-keepalive "$KEEPALIVE_ACTIVE"; then
-        log warn "wg set activate failed peer_id=$remote_peer_id endpoint=$endpoint"
-        return 1
+    if [ -n "$endpoint" ]; then
+        if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" endpoint "$endpoint" persistent-keepalive "$KEEPALIVE_ACTIVE"; then
+            log warn "wg set activate failed peer_id=$remote_peer_id endpoint=$endpoint"
+            return 1
+        fi
+    else
+        log debug "activate peer_id=$remote_peer_id: no endpoint in cache, adding peer without endpoint"
+        if ! wg set "$WG_INTERFACE" peer "$remote_pubkey"; then
+            log warn "wg set activate failed peer_id=$remote_peer_id (no endpoint)"
+            return 1
+        fi
     fi
 
     cache_set_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "ACTIVATING" || true
-    publish_control "$remote_peer_id" "activate"
+    if [ "$reason" != "remote-request" ]; then
+        publish_control "$remote_peer_id" "activate"
+    fi
 
-    log info "activate peer_id=$remote_peer_id endpoint=$endpoint reason=$reason"
+    log info "activate peer_id=$remote_peer_id endpoint=${endpoint:-none} reason=$reason"
     return 0
 }
 
@@ -737,7 +749,9 @@ deactivate_peer() {
 
     cache_clear_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "INACTIVE" || true
-    publish_control "$remote_peer_id" "deactivate"
+    if [ "$reason" != "remote-request" ]; then
+        publish_control "$remote_peer_id" "deactivate"
+    fi
 
     log info "deactivate peer_id=$remote_peer_id reason=$reason"
     return 0
@@ -940,6 +954,23 @@ peer_sync_loop() {
 
         if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
             publish_observation_for_peer "$LOCAL_PUBLIC_KEY" "$LOCAL_PEER_ID" "$EXPLICIT_ENDPOINT" "0" "0"
+        fi
+
+        if [ -n "$DETECTOR_PEER_ID" ]; then
+            detector_pubkey="$(cache_get_str "$DETECTOR_PEER_ID" "public_key")"
+            if [ -n "$detector_pubkey" ]; then
+                detector_state="$(cache_get_str "$DETECTOR_PEER_ID" "state")"
+
+                if [ -z "$detector_state" ] || [ "$detector_state" = "INACTIVE" ]  || ! wg show "$WG_INTERFACE" peers | grep -Fxq "$detector_pubkey"; then
+                    log debug "detector check: peer_id=$DETECTOR_PEER_ID state=$detector_state, activating for endpoint detection"
+                    activate_peer "$DETECTOR_PEER_ID" "$detector_pubkey" "endpoint-detection" || true
+                elif [ "$detector_state" = "CONNECTED" ] || [ "$detector_state" = "ACTIVATING" ]; then
+                    :
+                else
+                    log debug "detector check: peer_id=$DETECTOR_PEER_ID state=$detector_state, deactivating"
+                    deactivate_peer "$DETECTOR_PEER_ID" "$detector_pubkey" "endpoint-detection" || true
+                fi
+            fi
         fi
 
         sleep "$STATE_INTERVAL"
