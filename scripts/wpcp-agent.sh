@@ -33,8 +33,7 @@ DETECTOR_PEER_IDS=""
 LOCAL_PUBLIC_KEY=""
 LOCAL_PEER_ID=""
 
-PID_CONTROL=""
-PID_SYNC=""
+ALL_PIDS=""
 RUNNING="1"
 
 # Function: usage
@@ -46,7 +45,7 @@ usage() {
 Usage: $APP_NAME --interface IFACE --broker HOST [options]
 
 Required:
-  -i, --interface IFACE        WireGuard interface name (for example: wg0)
+  -i, --interface IFACE[,IFACE] WireGuard interface name(s), comma-separated (for example: wg0 or wg0,wg1)
   -b, --broker HOST            MQTT broker host/IP
 
 Optional:
@@ -97,10 +96,10 @@ log() {
     msg_n="$(log_level_num "$level")"
     if [ "$msg_n" -ge "$cur_n" ]; then
         if [ "${WPCP_LOG_NO_TS:-0}" = "1" ]; then
-            printf '[%s] %s\n' "$level" "$*"
+            printf '[%s] [%s] %s\n' "$WG_INTERFACE" "$level" "$*"
         else
             now_ts="$(date '+%Y-%m-%d %H:%M:%S')"
-            printf '%s [%s] %s\n' "$now_ts" "$level" "$*"
+            printf '%s [%s] [%s] %s\n' "$now_ts" "$WG_INTERFACE" "$level" "$*"
         fi
     fi
 }
@@ -124,11 +123,17 @@ require_cmd() {
 }
 
 # Function: validate_args
-# Purpose: Validate CLI options and derive default cache paths.
+# Purpose: Validate CLI options and check for incompatible argument combinations.
 # Inputs: Global config variables populated by parse_args.
-# Outputs: Updates CACHE_FILE/CACHE_LOCK_DIR; exits on invalid args.
+# Outputs: Exits on invalid args.
 validate_args() {
     [ -n "$WG_INTERFACE" ] || die "--interface is required"
+
+    case "$WG_INTERFACE" in
+        *,*)
+            [ -z "$CACHE_FILE" ] || die "--cache-file cannot be used with multiple interfaces"
+            ;;
+    esac
     [ -n "$MQTT_BROKER" ] || die "--broker is required"
 
     case "$MQTT_TLS" in
@@ -183,10 +188,6 @@ validate_args() {
         [ -r "$MQTT_KEY" ] || die "cannot read --key: $MQTT_KEY"
     fi
 
-    if [ -z "$CACHE_FILE" ]; then
-        CACHE_FILE="/tmp/wpcp-${WG_INTERFACE}-cache.json"
-    fi
-    CACHE_LOCK_DIR="${CACHE_FILE}.lock"
 }
 
 # Function: parse_args
@@ -1010,12 +1011,9 @@ cleanup() {
 
     RUNNING="0"
 
-    if [ -n "$PID_CONTROL" ]; then
-        kill "$PID_CONTROL" 2>/dev/null || true
-    fi
-    if [ -n "$PID_SYNC" ]; then
-        kill "$PID_SYNC" 2>/dev/null || true
-    fi
+    for pid in $ALL_PIDS; do
+        kill "$pid" 2>/dev/null || true
+    done
 
     cache_unlock
 }
@@ -1040,35 +1038,54 @@ main() {
     validate_args
     setup_dependencies
 
-    wg show "$WG_INTERFACE" >/dev/null 2>&1 || die "WireGuard interface not found: $WG_INTERFACE"
-
-    LOCAL_PUBLIC_KEY="$(wg show "$WG_INTERFACE" public-key 2>/dev/null)"
-    [ -n "$LOCAL_PUBLIC_KEY" ] || die "failed to read local public key from interface $WG_INTERFACE"
-
-    LOCAL_PEER_ID="$(calc_peer_id "$LOCAL_PUBLIC_KEY")"
-    [ -n "$LOCAL_PEER_ID" ] || die "failed to calculate local peer_id"
-
-    cache_init
-    ensure_local_peer_record
-
-    if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
-        cache_set_endpoint "$LOCAL_PEER_ID" "$LOCAL_PUBLIC_KEY" "$EXPLICIT_ENDPOINT" "$LOCAL_PEER_ID" "$WG_INTERFACE" "0" "0" || true
-    fi
-
     trap 'handle_termination INT' INT
     trap 'handle_termination TERM' TERM
 
-    control_and_observation_subscriber_loop &
-    PID_CONTROL="$!"
+    orig_cache_file="$CACHE_FILE"
+    ifaces_saved_ifs="$IFS"
+    IFS=","
+    for iface in $WG_INTERFACE; do
+        IFS="$ifaces_saved_ifs"
 
-    peer_sync_loop &
-    PID_SYNC="$!"
+        wg show "$iface" >/dev/null 2>&1 || die "WireGuard interface not found: $iface"
 
-    log info "$APP_NAME started iface=$WG_INTERFACE local_peer_id=$LOCAL_PEER_ID cache=$CACHE_FILE"
+        LOCAL_PUBLIC_KEY="$(wg show "$iface" public-key 2>/dev/null)"
+        [ -n "$LOCAL_PUBLIC_KEY" ] || die "failed to read local public key from interface $iface"
+
+        LOCAL_PEER_ID="$(calc_peer_id "$LOCAL_PUBLIC_KEY")"
+        [ -n "$LOCAL_PEER_ID" ] || die "failed to calculate local peer_id for interface $iface"
+
+        WG_INTERFACE="$iface"
+        CACHE_FILE="${orig_cache_file:-/tmp/wpcp-${iface}-cache.json}"
+        CACHE_LOCK_DIR="${CACHE_FILE}.lock"
+
+        cache_init
+        ensure_local_peer_record
+
+        if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
+            cache_set_endpoint "$LOCAL_PEER_ID" "$LOCAL_PUBLIC_KEY" "$EXPLICIT_ENDPOINT" "$LOCAL_PEER_ID" "$WG_INTERFACE" "0" "0" || true
+        fi
+
+        control_and_observation_subscriber_loop &
+        pid_ctrl="$!"
+
+        peer_sync_loop &
+        pid_sync="$!"
+
+        ALL_PIDS="${ALL_PIDS} ${pid_ctrl} ${pid_sync}"
+
+        log info "$APP_NAME started iface=$iface local_peer_id=$LOCAL_PEER_ID cache=$CACHE_FILE"
+
+        IFS=","
+    done
+    IFS="$ifaces_saved_ifs"
 
     while [ "$RUNNING" = "1" ]; do
-        kill -0 "$PID_CONTROL" 2>/dev/null || break
-        kill -0 "$PID_SYNC" 2>/dev/null || break
+        all_alive=1
+        for pid in $ALL_PIDS; do
+            kill -0 "$pid" 2>/dev/null || { all_alive=0; break; }
+        done
+        [ "$all_alive" = "1" ] || break
         sleep 1
     done
 
