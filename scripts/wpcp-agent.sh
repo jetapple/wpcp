@@ -635,14 +635,15 @@ mqtt_subscribe_stream() {
 
 # Function: publish_control
 # Purpose: Publish activate/deactivate control message for a target peer.
-# Inputs: $1 = target peer_id, $2 = message type.
+# Inputs: $1 = target peer_id, $2 = message type, $3 = reason.
 # Outputs: Sends MQTT message; logs warning on failure.
 publish_control() {
     target_peer_id="$1"
     msg_type="$2"
+    local reason="$3"
 
     topic="$TOPIC_PREFIX/peer/$target_peer_id/control"
-    payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" '{type:$t,peer_id:$pid,public_key:$pk}')"
+    payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r}')"
     mqtt_pub "$topic" "$payload" "$QOS_CONTROL" >/dev/null 2>&1 || log warn "failed to publish $msg_type to $topic"
 }
 
@@ -728,6 +729,7 @@ activate_peer() {
     remote_peer_id="$1"
     remote_pubkey="$2"
     reason="$3"
+    log debug "activating peer_id=$remote_peer_id reason=$reason"
 
     endpoint="$(select_activation_endpoint "$remote_peer_id")"
 
@@ -746,8 +748,8 @@ activate_peer() {
 
     cache_set_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "ACTIVATING" || true
-    if [ "$reason" != "remote-request" ]; then
-        publish_control "$remote_peer_id" "activate"
+    if [ "$reason" != "peer-request" ]; then
+        publish_control "$remote_peer_id" "activate" "peer-request"
     fi
 
     log info "activate peer_id=$remote_peer_id endpoint=${endpoint:-none} reason=$reason"
@@ -762,6 +764,7 @@ deactivate_peer() {
     remote_peer_id="$1"
     remote_pubkey="$2"
     reason="$3"
+    log debug "deactivating peer_id=$remote_peer_id reason=$reason"
 
     if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" remove; then
         log warn "wg set deactivate failed peer_id=$remote_peer_id"
@@ -770,8 +773,8 @@ deactivate_peer() {
 
     cache_clear_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "INACTIVE" || true
-    if [ "$reason" != "remote-request" ]; then
-        publish_control "$remote_peer_id" "deactivate"
+    if [ "$reason" != "peer-request" ]; then
+        publish_control "$remote_peer_id" "deactivate" "peer-request"
     fi
 
     log info "deactivate peer_id=$remote_peer_id reason=$reason"
@@ -830,6 +833,9 @@ handle_control_message() {
     msg_type="$(printf '%s' "$payload" | jq -r '.type // empty')"
     source_peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
     source_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
+    reason="$(printf '%s' "$payload" | jq -r '.reason // "remote-request"')"
+
+    log debug "received control type=$msg_type from peer_id=$source_peer_id reason=$reason"
 
     [ -n "$msg_type" ] || return 0
     [ -n "$source_peer_id" ] || return 0
@@ -844,10 +850,10 @@ handle_control_message() {
 
     case "$msg_type" in
         activate)
-            activate_peer "$source_peer_id" "$source_pubkey" "remote-request"
+            activate_peer "$source_peer_id" "$source_pubkey" "$reason"
             ;;
         deactivate)
-            deactivate_peer "$source_peer_id" "$source_pubkey" "remote-request"
+            deactivate_peer "$source_peer_id" "$source_pubkey" "$reason"
             ;;
         *)
             log debug "ignore unknown control type=$msg_type"
