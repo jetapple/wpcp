@@ -97,10 +97,10 @@ log() {
     msg_n="$(log_level_num "$level")"
     if [ "$msg_n" -ge "$cur_n" ]; then
         if [ "${WPCP_LOG_NO_TS:-0}" = "1" ]; then
-            printf '[%s] %s\n' "$level" "$*"
+            printf '[%s] [%s] %s\n' "$WG_INTERFACE" "$level" "$*"
         else
             now_ts="$(date '+%Y-%m-%d %H:%M:%S')"
-            printf '%s [%s] %s\n' "$now_ts" "$level" "$*"
+            printf '%s [%s] [%s] %s\n' "$now_ts" "$WG_INTERFACE" "$level" "$*"
         fi
     fi
 }

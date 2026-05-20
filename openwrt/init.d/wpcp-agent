@@ -47,6 +47,7 @@ start_instance() {
     config_get topic_prefix "$section" topic_prefix "wg"
     config_get endpoint "$section" endpoint ""
     config_get detector "$section" detector ""
+    detector="${detector// /,}"
     config_get state_interval "$section" state_interval "10"
     config_get endpoint_timeout "$section" endpoint_timeout "180"
     config_get failed_timeout "$section" failed_timeout "30"
