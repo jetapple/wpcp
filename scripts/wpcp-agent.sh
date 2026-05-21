@@ -658,23 +658,16 @@ publish_observation_for_peer() {
     latest_hs="$4"
     handshake_age="$5"
 
-    family="$(detect_endpoint_family "$endpoint")"
-    cached_v4="$(cache_get_endpoint_v4 "$peer_id")"
-    cached_v6="$(cache_get_endpoint_v6 "$peer_id")"
-
     payload="$(jq -cn \
         --arg t "observation" \
         --arg pid "$peer_id" \
         --arg pk "$peer_pubkey" \
         --arg endpoint "$endpoint" \
-        --arg family "$family" \
-        --arg endpoint_v4 "$cached_v4" \
-        --arg endpoint_v6 "$cached_v6" \
         --arg observed_by "$LOCAL_PEER_ID" \
         --arg iface "$WG_INTERFACE" \
         --argjson latest "$latest_hs" \
         --argjson hs_age "$handshake_age" \
-        '{type:$t,peer_id:$pid,public_key:$pk,endpoint:$endpoint,endpoint_family:$family,endpoint_v4:$endpoint_v4,endpoint_v6:$endpoint_v6,latest_handshake:$latest,handshake_age:$hs_age,observed_by:$observed_by,interface:$iface}')"
+        '{type:$t,peer_id:$pid,public_key:$pk,endpoint:$endpoint,latest_handshake:$latest,handshake_age:$hs_age,observed_by:$observed_by,interface:$iface}')"
 
     topic="$TOPIC_PREFIX/peer/$peer_id/observation"
     mqtt_pub "$topic" "$payload" "$QOS_OBSERVATION" >/dev/null 2>&1 || log warn "failed to publish observation for peer_id=$peer_id"
@@ -791,8 +784,6 @@ handle_observation_message() {
     peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
     peer_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
     endpoint="$(printf '%s' "$payload" | jq -r '.endpoint // empty')"
-    endpoint_v4="$(printf '%s' "$payload" | jq -r '.endpoint_v4 // empty')"
-    endpoint_v6="$(printf '%s' "$payload" | jq -r '.endpoint_v6 // empty')"
     latest_hs="$(printf '%s' "$payload" | jq -r '.latest_handshake // 0')"
     hs_age="$(printf '%s' "$payload" | jq -r '.handshake_age // 0')"
     observed_by="$(printf '%s' "$payload" | jq -r '.observed_by // empty')"
@@ -807,20 +798,7 @@ handle_observation_message() {
     fi
 
     cache_ensure_peer "$peer_id" "$peer_pubkey" || true
-
-    if [ -n "$endpoint_v4" ]; then
-        cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint_v4" "$observed_by" "$obs_iface" "$latest_hs" "$hs_age" || true
-    fi
-    if [ -n "$endpoint_v6" ]; then
-        cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint_v6" "$observed_by" "$obs_iface" "$latest_hs" "$hs_age" || true
-    fi
-
-    if [ -n "$endpoint" ]; then
-        fam="$(detect_endpoint_family "$endpoint")"
-        if [ "$fam" = "ipv4" ] || [ "$fam" = "ipv6" ]; then
-            cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint" "$observed_by" "$obs_iface" "$latest_hs" "$hs_age" || true
-        fi
-    fi
+    cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint" "$observed_by" "$obs_iface" "$latest_hs" "$hs_age" || true
 }
 
 # Function: handle_control_message
