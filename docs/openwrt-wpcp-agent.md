@@ -14,11 +14,17 @@ This document describes the OpenWRT-compatible implementation in:
   - `endpoint_v4`
   - `endpoint_v6`
 - Activation endpoint selection policy:
+  - Optional `family` override is supported by activation flow:
+    - `ipv6`: select only target `endpoint_v6`.
+    - `ipv4`: select only target `endpoint_v4`.
+    - other/empty: use auto policy below.
   - If both local peer and target peer have cached IPv6 endpoints, use target IPv6 first.
   - Otherwise prefer target IPv4.
   - If no IPv4 but IPv6 exists, fallback to IPv6.
 - Uses `wg show` as the authoritative source for connectivity state.
 - Supports foreground run and OpenWRT procd service mode.
+- For control `activate`/`deactivate` messages, optional payload field `reason` is supported for intent/context propagation; if absent on receive, it defaults to `remote-request`.
+- For control `activate` messages, optional payload field `family` (`ipv4`/`ipv6`) is supported and propagated when relaying activate requests.
 
 ## Dependencies
 

@@ -242,9 +242,17 @@ Payload:
 
   "peer_id": "source_peer_id",
 
-  "public_key": "source_wireguard_public_key"
+  "public_key": "source_wireguard_public_key",
+
+  "reason": "peer-request|endpoint-detection|<custom>",
+
+  "family": "ipv4|ipv6" 
 }
 ```
+
+`reason` is optional. It carries activation intent/context for observability and policy decisions. If absent, receiver SHOULD treat it as `remote-request`.
+
+`family` is optional. When present and valid (`ipv4` or `ipv6`), receiver SHOULD activate using only that endpoint family. If absent or invalid, receiver SHOULD use automatic endpoint selection policy.
 
 Receivers SHOULD verify:
 
@@ -282,9 +290,13 @@ Payload:
 
   "peer_id": "source_peer_id",
 
-  "public_key": "source_wireguard_public_key"
+  "public_key": "source_wireguard_public_key",
+
+  "reason": "peer-request|endpoint-detection|<custom>"
 }
 ```
+
+`reason` is optional. It carries deactivation intent/context for observability and policy decisions. If absent, receiver SHOULD treat it as `remote-request`.
 
 Meaning:
 
@@ -561,7 +573,9 @@ Payload:
 
   "peer_id": "A_peer_id",
 
-  "public_key": "A_public_key"
+  "public_key": "A_public_key",
+
+  "reason": "peer-request"
 }
 ```
 
@@ -689,7 +703,9 @@ Payload:
 
   "peer_id": "source_peer_id",
 
-  "public_key": "source_public_key"
+  "public_key": "source_public_key",
+
+  "reason": "peer-request"
 }
 ```
 

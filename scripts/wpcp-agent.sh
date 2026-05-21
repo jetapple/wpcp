@@ -635,15 +635,20 @@ mqtt_subscribe_stream() {
 
 # Function: publish_control
 # Purpose: Publish activate/deactivate control message for a target peer.
-# Inputs: $1 = target peer_id, $2 = message type, $3 = reason.
+# Inputs: $1 = target peer_id, $2 = message type, $3 = reason, $4 = family (optional for activate).
 # Outputs: Sends MQTT message; logs warning on failure.
 publish_control() {
     target_peer_id="$1"
     msg_type="$2"
     local reason="$3"
+    local family="${4:-}"
 
     topic="$TOPIC_PREFIX/peer/$target_peer_id/control"
-    payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r}')"
+    if [ "$msg_type" = "activate" ] && { [ "$family" = "ipv4" ] || [ "$family" = "ipv6" ]; }; then
+        payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" --arg f "$family" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r,family:$f}')"
+    else
+        payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r}')"
+    fi
     mqtt_pub "$topic" "$payload" "$QOS_CONTROL" >/dev/null 2>&1 || log warn "failed to publish $msg_type to $topic"
 }
 
@@ -687,14 +692,25 @@ verify_peer_binding() {
 
 # Function: select_activation_endpoint
 # Purpose: Pick best endpoint for activation, preferring IPv6 dual-stack path.
-# Inputs: $1 = remote peer_id.
+# Inputs: $1 = remote peer_id, $2 = family preference (ipv4/ipv6/auto).
 # Outputs: Echoes selected endpoint or empty string.
 select_activation_endpoint() {
     remote_peer_id="$1"
+    family="${2:-auto}"
 
     local_v6="$(cache_get_endpoint_v6 "$LOCAL_PEER_ID")"
     remote_v6="$(cache_get_endpoint_v6 "$remote_peer_id")"
     remote_v4="$(cache_get_endpoint_v4 "$remote_peer_id")"
+
+    if [ "$family" = "ipv6" ]; then
+        echo "$remote_v6"
+        return
+    fi
+
+    if [ "$family" = "ipv4" ]; then
+        echo "$remote_v4"
+        return
+    fi
 
     if [ -n "$local_v6" ] && [ -n "$remote_v6" ]; then
         echo "$remote_v6"
@@ -716,15 +732,16 @@ select_activation_endpoint() {
 
 # Function: activate_peer
 # Purpose: Configure wg peer endpoint/keepalive and emit activate control.
-# Inputs: $1 = remote peer_id, $2 = remote public key, $3 = reason.
+# Inputs: $1 = remote peer_id, $2 = remote public key, $3 = reason, $4 = family preference (optional).
 # Outputs: Returns 0 on success, 1 on activation failure.
 activate_peer() {
     remote_peer_id="$1"
     remote_pubkey="$2"
     reason="$3"
-    log debug "activating peer_id=$remote_peer_id reason=$reason"
+    family="${4:-auto}"
+    log debug "activating peer_id=$remote_peer_id reason=$reason family=$family"
 
-    endpoint="$(select_activation_endpoint "$remote_peer_id")"
+    endpoint="$(select_activation_endpoint "$remote_peer_id" "$family")"
 
     if [ -n "$endpoint" ]; then
         if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" endpoint "$endpoint" persistent-keepalive "$KEEPALIVE_ACTIVE"; then
@@ -742,10 +759,10 @@ activate_peer() {
     cache_set_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "ACTIVATING" || true
     if [ "$reason" != "peer-request" ]; then
-        publish_control "$remote_peer_id" "activate" "peer-request"
+        publish_control "$remote_peer_id" "activate" "peer-request" "$(detect_endpoint_family "$endpoint")"
     fi
 
-    log info "activate peer_id=$remote_peer_id endpoint=${endpoint:-none} reason=$reason"
+    log info "activate peer_id=$remote_peer_id endpoint=${endpoint:-none} reason=$reason family=$family"
     return 0
 }
 
@@ -812,8 +829,14 @@ handle_control_message() {
     source_peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
     source_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
     reason="$(printf '%s' "$payload" | jq -r '.reason // "remote-request"')"
+    family="$(printf '%s' "$payload" | jq -r '.family // "auto"')"
 
-    log debug "received control type=$msg_type from peer_id=$source_peer_id reason=$reason"
+    case "$family" in
+        ipv4|ipv6) ;;
+        *) family="auto" ;;
+    esac
+
+    log debug "received control type=$msg_type from peer_id=$source_peer_id reason=$reason family=$family"
 
     [ -n "$msg_type" ] || return 0
     [ -n "$source_peer_id" ] || return 0
@@ -828,7 +851,7 @@ handle_control_message() {
 
     case "$msg_type" in
         activate)
-            activate_peer "$source_peer_id" "$source_pubkey" "$reason"
+            activate_peer "$source_peer_id" "$source_pubkey" "$reason" "$family"
             ;;
         deactivate)
             deactivate_peer "$source_peer_id" "$source_pubkey" "$reason"
