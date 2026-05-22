@@ -100,7 +100,7 @@ log() {
         if [ "${WPCP_LOG_NO_TS:-0}" = "1" ]; then
             printf '[%s] [%s] %s\n' "$WG_INTERFACE" "$level" "$*"
         else
-            local now_ts="$(date '+%Y-%m-%d %H:%M:%S')"
+            local now_ts="$(date -u '+%Y-%m-%d %H:%M:%S')"
             printf '%s [%s] [%s] %s\n' "$now_ts" "$WG_INTERFACE" "$level" "$*"
         fi
     fi
@@ -462,7 +462,7 @@ split_detector_peer_ids() {
 cache_ensure_peer() {
     local pid="$1"
     local pubkey="$2"
-    local now_epoch="$(date +%s)"
+    local now_epoch="$(date -u +%s)"
 
     cache_update_with_jq \
         --arg pid "$pid" \
@@ -485,7 +485,7 @@ cache_set_endpoint() {
     local handshake_age="$7"
 
     local family="$(detect_endpoint_family "$endpoint")"
-    local now_epoch="$(date +%s)"
+    local now_epoch="$(date -u +%s)"
 
     if [ "$family" = "ipv4" ]; then
         cache_update_with_jq \
@@ -532,7 +532,7 @@ cache_set_endpoint() {
 # Outputs: Returns cache_update_with_jq status.
 cache_set_activation_started() {
     local pid="$1"
-    local now_epoch="$(date +%s)"
+    local now_epoch="$(date -u +%s)"
     cache_update_with_jq --arg pid "$pid" --argjson now "$now_epoch" '.peers[$pid] = ((.peers[$pid] // {}) + {activation_started_at:$now})'
 }
 
@@ -552,7 +552,7 @@ cache_clear_activation_started() {
 cache_set_state() {
     local pid="$1"
     local state="$2"
-    local now_epoch="$(date +%s)"
+    local now_epoch="$(date -u +%s)"
     cache_update_with_jq --arg pid "$pid" --arg state "$state" --argjson now "$now_epoch" '.peers[$pid] = ((.peers[$pid] // {}) + {state:$state, state_updated_at:$now})'
 }
 
@@ -928,7 +928,7 @@ reconcile_peer_state() {
     local hs_age="$4"
     local keepalive="$5"
 
-    local now_epoch="$(date +%s)"
+    local now_epoch="$(date -u +%s)"
     local peer_id="$(calc_peer_id "$peer_pubkey")"
 
     local state="IDLE"
@@ -972,7 +972,7 @@ peer_sync_loop() {
     while true; do
         ensure_local_peer_record
 
-        now_epoch="$(date +%s)"
+        now_epoch="$(date -u +%s)"
 
         wg show "$WG_INTERFACE" dump | tail -n +2 | while IFS="$(printf '\t')" read -r peer_pubkey _psk endpoint _allowed latest_hs _rx _tx keepalive; do
             [ -n "$peer_pubkey" ] || continue
