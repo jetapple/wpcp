@@ -77,7 +77,8 @@ EOF
 # Inputs: $1 = level string (debug/info/warn/error).
 # Outputs: Echoes numeric level to stdout.
 log_level_num() {
-    case "$1" in
+    local level="$1"
+    case "$level" in
         debug) echo 10 ;;
         info)  echo 20 ;;
         warn)  echo 30 ;;
@@ -91,15 +92,15 @@ log_level_num() {
 # Inputs: $1 = message level, $2..$n = message text.
 # Outputs: Writes formatted log line to stdout when level is enabled.
 log() {
-    level="$1"
+    local level="$1"
     shift
-    cur_n="$(log_level_num "$LOG_LEVEL")"
-    msg_n="$(log_level_num "$level")"
+    local cur_n="$(log_level_num "$LOG_LEVEL")"
+    local msg_n="$(log_level_num "$level")"
     if [ "$msg_n" -ge "$cur_n" ]; then
         if [ "${WPCP_LOG_NO_TS:-0}" = "1" ]; then
             printf '[%s] [%s] %s\n' "$WG_INTERFACE" "$level" "$*"
         else
-            now_ts="$(date '+%Y-%m-%d %H:%M:%S')"
+            local now_ts="$(date '+%Y-%m-%d %H:%M:%S')"
             printf '%s [%s] [%s] %s\n' "$now_ts" "$WG_INTERFACE" "$level" "$*"
         fi
     fi
@@ -110,7 +111,8 @@ log() {
 # Inputs: $1..$n = error message text.
 # Outputs: Writes error log and exits with status 1.
 die() {
-    log error "$*"
+    local message="$*"
+    log error "$message"
     exit 1
 }
 
@@ -119,7 +121,7 @@ die() {
 # Inputs: $1 = command name.
 # Outputs: No stdout on success; exits on missing command.
 require_cmd() {
-    cmd="$1"
+    local cmd="$1"
     command -v "$cmd" >/dev/null 2>&1 || die "missing required command: $cmd"
 }
 
@@ -195,85 +197,87 @@ validate_args() {
 # Outputs: Sets global config variables; may call usage and exit.
 parse_args() {
     while [ "$#" -gt 0 ]; do
-        case "$1" in
+        local opt="$1"
+        local val="${2:-}"
+        case "$opt" in
             -i|--interface)
-                WG_INTERFACE="$2"
+                WG_INTERFACE="$val"
                 shift 2
                 ;;
             -b|--broker)
-                MQTT_BROKER="$2"
+                MQTT_BROKER="$val"
                 shift 2
                 ;;
             -p|--port)
-                MQTT_PORT="$2"
+                MQTT_PORT="$val"
                 shift 2
                 ;;
             --username)
-                MQTT_USERNAME="$2"
+                MQTT_USERNAME="$val"
                 shift 2
                 ;;
             --password)
-                MQTT_PASSWORD="$2"
+                MQTT_PASSWORD="$val"
                 shift 2
                 ;;
             --tls)
-                MQTT_TLS="$2"
+                MQTT_TLS="$val"
                 shift 2
                 ;;
             --cafile)
-                MQTT_CAFILE="$2"
+                MQTT_CAFILE="$val"
                 shift 2
                 ;;
             --cert)
-                MQTT_CERT="$2"
+                MQTT_CERT="$val"
                 shift 2
                 ;;
             --key)
-                MQTT_KEY="$2"
+                MQTT_KEY="$val"
                 shift 2
                 ;;
             --topic-prefix)
-                TOPIC_PREFIX="$2"
+                TOPIC_PREFIX="$val"
                 shift 2
                 ;;
             --state-interval)
-                STATE_INTERVAL="$2"
+                STATE_INTERVAL="$val"
                 shift 2
                 ;;
             --endpoint-timeout)
-                ENDPOINT_TIMEOUT="$2"
+                ENDPOINT_TIMEOUT="$val"
                 shift 2
                 ;;
             --failed-timeout)
-                FAILED_TIMEOUT="$2"
+                FAILED_TIMEOUT="$val"
                 shift 2
                 ;;
             --keepalive-active)
-                KEEPALIVE_ACTIVE="$2"
+                KEEPALIVE_ACTIVE="$val"
                 shift 2
                 ;;
             -e|--endpoint)
-                EXPLICIT_ENDPOINT="$2"
+                EXPLICIT_ENDPOINT="$val"
                 shift 2
                 ;;
             --qos-control)
-                QOS_CONTROL="$2"
+                QOS_CONTROL="$val"
                 shift 2
                 ;;
             --qos-observation)
-                QOS_OBSERVATION="$2"
+                QOS_OBSERVATION="$val"
                 shift 2
                 ;;
             --cache-file)
-                CACHE_FILE="$2"
+                CACHE_FILE="$val"
                 shift 2
                 ;;
             --log-level)
-                LOG_LEVEL="$2"
+                LOG_LEVEL="$val"
                 shift 2
                 ;;
             -d|--detector)
-                DETECTOR_PEER_IDS="$2"
+                DETECTOR_PEER_IDS="$val"
                 shift 2
                 ;;
             -h|--help)
@@ -281,7 +285,7 @@ parse_args() {
                 exit 0
                 ;;
             *)
-                die "unknown argument: $1"
+                die "unknown argument: $opt"
                 ;;
         esac
     done
@@ -309,7 +313,7 @@ setup_dependencies() {
 # Inputs: $1 = peer public key.
 # Outputs: Echoes computed peer_id to stdout.
 calc_peer_id() {
-    pubkey="$1"
+    local pubkey="$1"
 
     if command -v openssl >/dev/null 2>&1; then
         printf '%s' "$pubkey" \
@@ -321,7 +325,7 @@ calc_peer_id() {
         return 0
     fi
 
-    hash32="$(printf '%s' "$pubkey" | sha256sum | awk '{print $1}' | cut -c1-32)"
+    local hash32="$(printf '%s' "$pubkey" | sha256sum | awk '{print $1}' | cut -c1-32)"
     printf '%s' "$hash32" \
         | xxd -r -p 2>/dev/null \
         | base32 2>/dev/null \
@@ -364,10 +368,10 @@ cache_init() {
 # Inputs: $1 = jq filter, remaining args = jq arguments.
 # Outputs: Returns 0 on success, 1 on jq/apply failure.
 cache_update_with_jq() {
-    jq_filter="$1"
+    local jq_filter="$1"
     shift
 
-    tmp_file="${CACHE_FILE}.tmp"
+    local tmp_file="${CACHE_FILE}.tmp"
 
     cache_lock
     if ! jq "$jq_filter" "$@" "$CACHE_FILE" > "$tmp_file" 2>/dev/null; then
@@ -385,8 +389,8 @@ cache_update_with_jq() {
 # Inputs: $1 = peer_id, $2 = field name.
 # Outputs: Echoes string value or empty string.
 cache_get_str() {
-    pid="$1"
-    key="$2"
+    local pid="$1"
+    local key="$2"
     jq -r --arg pid "$pid" --arg key "$key" '.peers[$pid][$key] // ""' "$CACHE_FILE" 2>/dev/null
 }
 
@@ -395,8 +399,8 @@ cache_get_str() {
 # Inputs: $1 = peer_id, $2 = field name.
 # Outputs: Echoes numeric value or 0.
 cache_get_num() {
-    pid="$1"
-    key="$2"
+    local pid="$1"
+    local key="$2"
     jq -r --arg pid "$pid" --arg key "$key" '.peers[$pid][$key] // 0' "$CACHE_FILE" 2>/dev/null
 }
 
@@ -405,7 +409,7 @@ cache_get_num() {
 # Inputs: $1 = endpoint string from wg or observation.
 # Outputs: Echoes endpoint family label.
 detect_endpoint_family() {
-    endpoint="$1"
+    local endpoint="$1"
 
     if [ -z "$endpoint" ] || [ "$endpoint" = "(none)" ]; then
         echo "none"
@@ -426,7 +430,7 @@ detect_endpoint_family() {
             ;;
     esac
 
-    colon_count="$(printf '%s' "$endpoint" | tr -cd ':' | wc -c | awk '{print $1}')"
+    local colon_count="$(printf '%s' "$endpoint" | tr -cd ':' | wc -c | awk '{print $1}')"
     if [ "$colon_count" -ge 2 ]; then
         echo "ipv6"
         return
@@ -440,7 +444,7 @@ detect_endpoint_family() {
 # Inputs: $1 = comma-separated detector peer IDs.
 # Outputs: Prints one normalized peer_id per line.
 split_detector_peer_ids() {
-    detector_raw="$1"
+    local detector_raw="$1"
 
     [ -n "$detector_raw" ] || return 0
 
@@ -456,9 +460,9 @@ split_detector_peer_ids() {
 # Inputs: $1 = peer_id, $2 = public key.
 # Outputs: Returns cache_update_with_jq status.
 cache_ensure_peer() {
-    pid="$1"
-    pubkey="$2"
-    now_epoch="$(date +%s)"
+    local pid="$1"
+    local pubkey="$2"
+    local now_epoch="$(date +%s)"
 
     cache_update_with_jq \
         --arg pid "$pid" \
@@ -472,16 +476,16 @@ cache_ensure_peer() {
     # Inputs: $1 = peer_id, $2 = public key, $3 = endpoint, $4 = observed_by, $5 = interface, $6 = latest_handshake, $7 = handshake_age.
     # Outputs: Returns cache_update_with_jq status.
 cache_set_endpoint() {
-    pid="$1"
-    pubkey="$2"
-    endpoint="$3"
-    observed_by="$4"
-    obs_iface="$5"
-    latest_hs="$6"
-    handshake_age="$7"
+    local pid="$1"
+    local pubkey="$2"
+    local endpoint="$3"
+    local observed_by="$4"
+    local obs_iface="$5"
+    local latest_hs="$6"
+    local handshake_age="$7"
 
-    family="$(detect_endpoint_family "$endpoint")"
-    now_epoch="$(date +%s)"
+    local family="$(detect_endpoint_family "$endpoint")"
+    local now_epoch="$(date +%s)"
 
     if [ "$family" = "ipv4" ]; then
         cache_update_with_jq \
@@ -527,8 +531,8 @@ cache_set_endpoint() {
 # Inputs: $1 = peer_id.
 # Outputs: Returns cache_update_with_jq status.
 cache_set_activation_started() {
-    pid="$1"
-    now_epoch="$(date +%s)"
+    local pid="$1"
+    local now_epoch="$(date +%s)"
     cache_update_with_jq --arg pid "$pid" --argjson now "$now_epoch" '.peers[$pid] = ((.peers[$pid] // {}) + {activation_started_at:$now})'
 }
 
@@ -537,7 +541,7 @@ cache_set_activation_started() {
 # Inputs: $1 = peer_id.
 # Outputs: Returns cache_update_with_jq status.
 cache_clear_activation_started() {
-    pid="$1"
+    local pid="$1"
     cache_update_with_jq --arg pid "$pid" '.peers[$pid] = ((.peers[$pid] // {}) | del(.activation_started_at))'
 }
 
@@ -546,9 +550,9 @@ cache_clear_activation_started() {
 # Inputs: $1 = peer_id, $2 = state string.
 # Outputs: Returns cache_update_with_jq status.
 cache_set_state() {
-    pid="$1"
-    state="$2"
-    now_epoch="$(date +%s)"
+    local pid="$1"
+    local state="$2"
+    local now_epoch="$(date +%s)"
     cache_update_with_jq --arg pid "$pid" --arg state "$state" --argjson now "$now_epoch" '.peers[$pid] = ((.peers[$pid] // {}) + {state:$state, state_updated_at:$now})'
 }
 
@@ -557,7 +561,7 @@ cache_set_state() {
 # Inputs: $1 = peer_id.
 # Outputs: Echoes endpoint string or empty.
 cache_get_endpoint_v4() {
-    pid="$1"
+    local pid="$1"
     cache_get_str "$pid" "endpoint_v4"
 }
 
@@ -566,7 +570,7 @@ cache_get_endpoint_v4() {
 # Inputs: $1 = peer_id.
 # Outputs: Echoes endpoint string or empty.
 cache_get_endpoint_v6() {
-    pid="$1"
+    local pid="$1"
     cache_get_str "$pid" "endpoint_v6"
 }
 
@@ -575,9 +579,9 @@ cache_get_endpoint_v6() {
 # Inputs: $1 = topic, $2 = payload, $3 = qos.
 # Outputs: Forwards mosquitto_pub exit status.
 mqtt_pub() {
-    topic="$1"
-    payload="$2"
-    qos="$3"
+    local topic="$1"
+    local payload="$2"
+    local qos="$3"
 
     set -- mosquitto_pub -h "$MQTT_BROKER" -p "$MQTT_PORT" -q "$qos" -t "$topic" -m "$payload"
     if [ -n "$MQTT_USERNAME" ]; then
@@ -607,8 +611,8 @@ mqtt_pub() {
 # Inputs: $1 = control topic, $2 = observation topic wildcard.
 # Outputs: Streams mosquitto_sub lines to stdout.
 mqtt_subscribe_stream() {
-    control_topic="$1"
-    obs_topic="$2"
+    local control_topic="$1"
+    local obs_topic="$2"
 
     set -- mosquitto_sub -h "$MQTT_BROKER" -p "$MQTT_PORT" -v -q 1 -t "$control_topic" -t "$obs_topic"
     if [ -n "$MQTT_USERNAME" ]; then
@@ -635,19 +639,20 @@ mqtt_subscribe_stream() {
 
 # Function: publish_control
 # Purpose: Publish activate/deactivate control message for a target peer.
-# Inputs: $1 = target peer_id, $2 = message type, $3 = reason, $4 = family (optional for activate).
+# Inputs: $1 = target peer_id, $2 = message type, $3 = reason, $4 = target public key, $5 = family (optional for activate).
 # Outputs: Sends MQTT message; logs warning on failure.
 publish_control() {
-    target_peer_id="$1"
-    msg_type="$2"
+    local target_peer_id="$1"
+    local msg_type="$2"
     local reason="$3"
-    local family="${4:-}"
+    local target_pubkey="$4"
+    local family="${5:-}"
 
-    topic="$TOPIC_PREFIX/peer/$target_peer_id/control"
+    local topic="$TOPIC_PREFIX/peer/$target_peer_id/control"
     if [ "$msg_type" = "activate" ] && { [ "$family" = "ipv4" ] || [ "$family" = "ipv6" ]; }; then
-        payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" --arg f "$family" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r,family:$f}')"
+        local payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" --arg tpk "$target_pubkey" --arg f "$family" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r,target_public_key:$tpk,family:$f}')"
     else
-        payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r}')"
+        local payload="$(jq -cn --arg t "$msg_type" --arg pid "$LOCAL_PEER_ID" --arg pk "$LOCAL_PUBLIC_KEY" --arg r "$reason" --arg tpk "$target_pubkey" '{type:$t,peer_id:$pid,public_key:$pk,reason:$r,target_public_key:$tpk}')"
     fi
     mqtt_pub "$topic" "$payload" "$QOS_CONTROL" >/dev/null 2>&1 || log warn "failed to publish $msg_type to $topic"
 }
@@ -657,13 +662,13 @@ publish_control() {
 # Inputs: $1 = peer public key, $2 = peer_id, $3 = endpoint, $4 = latest_handshake, $5 = handshake_age.
 # Outputs: Sends MQTT message; logs warning on failure.
 publish_observation_for_peer() {
-    peer_pubkey="$1"
-    peer_id="$2"
-    endpoint="$3"
-    latest_hs="$4"
-    handshake_age="$5"
+    local peer_pubkey="$1"
+    local peer_id="$2"
+    local endpoint="$3"
+    local latest_hs="$4"
+    local handshake_age="$5"
 
-    payload="$(jq -cn \
+    local payload="$(jq -cn \
         --arg t "observation" \
         --arg pid "$peer_id" \
         --arg pk "$peer_pubkey" \
@@ -674,7 +679,7 @@ publish_observation_for_peer() {
         --argjson hs_age "$handshake_age" \
         '{type:$t,peer_id:$pid,public_key:$pk,endpoint:$endpoint,latest_handshake:$latest,handshake_age:$hs_age,observed_by:$observed_by,interface:$iface}')"
 
-    topic="$TOPIC_PREFIX/peer/$peer_id/observation"
+    local topic="$TOPIC_PREFIX/peer/$peer_id/observation"
     mqtt_pub "$topic" "$payload" "$QOS_OBSERVATION" >/dev/null 2>&1 || log warn "failed to publish observation for peer_id=$peer_id"
 }
 
@@ -683,10 +688,10 @@ publish_observation_for_peer() {
 # Inputs: $1 = peer_id, $2 = public key.
 # Outputs: Returns success when binding is valid.
 verify_peer_binding() {
-    peer_id="$1"
-    pubkey="$2"
+    local peer_id="$1"
+    local pubkey="$2"
 
-    calc_id="$(calc_peer_id "$pubkey")"
+    local calc_id="$(calc_peer_id "$pubkey")"
     [ "$calc_id" = "$peer_id" ]
 }
 
@@ -695,12 +700,12 @@ verify_peer_binding() {
 # Inputs: $1 = remote peer_id, $2 = family preference (ipv4/ipv6/auto).
 # Outputs: Echoes selected endpoint or empty string.
 select_activation_endpoint() {
-    remote_peer_id="$1"
-    family="${2:-auto}"
+    local remote_peer_id="$1"
+    local family="${2:-auto}"
 
-    local_v6="$(cache_get_endpoint_v6 "$LOCAL_PEER_ID")"
-    remote_v6="$(cache_get_endpoint_v6 "$remote_peer_id")"
-    remote_v4="$(cache_get_endpoint_v4 "$remote_peer_id")"
+    local local_v6="$(cache_get_endpoint_v6 "$LOCAL_PEER_ID")"
+    local remote_v6="$(cache_get_endpoint_v6 "$remote_peer_id")"
+    local remote_v4="$(cache_get_endpoint_v4 "$remote_peer_id")"
 
     if [ "$family" = "ipv6" ]; then
         echo "$remote_v6"
@@ -735,13 +740,13 @@ select_activation_endpoint() {
 # Inputs: $1 = remote peer_id, $2 = remote public key, $3 = reason, $4 = family preference (optional).
 # Outputs: Returns 0 on success, 1 on activation failure.
 activate_peer() {
-    remote_peer_id="$1"
-    remote_pubkey="$2"
-    reason="$3"
-    family="${4:-auto}"
+    local remote_peer_id="$1"
+    local remote_pubkey="$2"
+    local reason="$3"
+    local family="${4:-auto}"
     log debug "activating peer_id=$remote_peer_id reason=$reason family=$family"
 
-    endpoint="$(select_activation_endpoint "$remote_peer_id" "$family")"
+    local endpoint="$(select_activation_endpoint "$remote_peer_id" "$family")"
 
     if [ -n "$endpoint" ]; then
         if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" endpoint "$endpoint" persistent-keepalive "$KEEPALIVE_ACTIVE"; then
@@ -759,7 +764,7 @@ activate_peer() {
     cache_set_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "ACTIVATING" || true
     if [ "$reason" != "peer-request" ]; then
-        publish_control "$remote_peer_id" "activate" "peer-request" "$(detect_endpoint_family "$endpoint")"
+        publish_control "$remote_peer_id" "activate" "peer-request" "$remote_pubkey" "$(detect_endpoint_family "$endpoint")"
     fi
 
     log info "activate peer_id=$remote_peer_id endpoint=${endpoint:-none} reason=$reason family=$family"
@@ -771,9 +776,9 @@ activate_peer() {
 # Inputs: $1 = remote peer_id, $2 = remote public key, $3 = reason.
 # Outputs: Returns 0 on success, 1 on deactivation failure.
 deactivate_peer() {
-    remote_peer_id="$1"
-    remote_pubkey="$2"
-    reason="$3"
+    local remote_peer_id="$1"
+    local remote_pubkey="$2"
+    local reason="$3"
     log debug "deactivating peer_id=$remote_peer_id reason=$reason"
 
     if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" remove; then
@@ -784,7 +789,7 @@ deactivate_peer() {
     cache_clear_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "INACTIVE" || true
     if [ "$reason" != "peer-request" ]; then
-        publish_control "$remote_peer_id" "deactivate" "peer-request"
+        publish_control "$remote_peer_id" "deactivate" "peer-request" "$remote_pubkey"
     fi
 
     log info "deactivate peer_id=$remote_peer_id reason=$reason"
@@ -796,15 +801,15 @@ deactivate_peer() {
 # Inputs: $1 = raw JSON payload string.
 # Outputs: Updates cache; returns 0 for handled/ignored payload.
 handle_observation_message() {
-    payload="$1"
+    local payload="$1"
 
-    peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
-    peer_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
-    endpoint="$(printf '%s' "$payload" | jq -r '.endpoint // empty')"
-    latest_hs="$(printf '%s' "$payload" | jq -r '.latest_handshake // 0')"
-    hs_age="$(printf '%s' "$payload" | jq -r '.handshake_age // 0')"
-    observed_by="$(printf '%s' "$payload" | jq -r '.observed_by // empty')"
-    obs_iface="$(printf '%s' "$payload" | jq -r '.interface // empty')"
+    local peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
+    local peer_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
+    local endpoint="$(printf '%s' "$payload" | jq -r '.endpoint // empty')"
+    local latest_hs="$(printf '%s' "$payload" | jq -r '.latest_handshake // 0')"
+    local hs_age="$(printf '%s' "$payload" | jq -r '.handshake_age // 0')"
+    local observed_by="$(printf '%s' "$payload" | jq -r '.observed_by // empty')"
+    local obs_iface="$(printf '%s' "$payload" | jq -r '.interface // empty')"
 
     [ -n "$peer_id" ] || return 0
     [ -n "$peer_pubkey" ] || return 0
@@ -823,13 +828,14 @@ handle_observation_message() {
 # Inputs: $1 = raw JSON payload string.
 # Outputs: Performs activate/deactivate side effects; returns 0 for handled/ignored payload.
 handle_control_message() {
-    payload="$1"
+    local payload="$1"
 
-    msg_type="$(printf '%s' "$payload" | jq -r '.type // empty')"
-    source_peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
-    source_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
-    reason="$(printf '%s' "$payload" | jq -r '.reason // "remote-request"')"
-    family="$(printf '%s' "$payload" | jq -r '.family // "auto"')"
+    local msg_type="$(printf '%s' "$payload" | jq -r '.type // empty')"
+    local source_peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
+    local source_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
+    local target_pubkey="$(printf '%s' "$payload" | jq -r '.target_public_key // empty')"
+    local reason="$(printf '%s' "$payload" | jq -r '.reason // "remote-request"')"
+    local family="$(printf '%s' "$payload" | jq -r '.family // "auto"')"
 
     case "$family" in
         ipv4|ipv6) ;;
@@ -841,9 +847,23 @@ handle_control_message() {
     [ -n "$msg_type" ] || return 0
     [ -n "$source_peer_id" ] || return 0
     [ -n "$source_pubkey" ] || return 0
+    [ -n "$target_pubkey" ] || {
+        log warn "discard control: missing target_public_key from peer_id=$source_peer_id"
+        return 0
+    }
 
     if ! verify_peer_binding "$source_peer_id" "$source_pubkey"; then
         log warn "discard control: peer_id/public_key mismatch peer_id=$source_peer_id"
+        return 0
+    fi
+
+    if ! verify_peer_binding "$LOCAL_PEER_ID" "$target_pubkey"; then
+        log warn "discard control: target_public_key does not match local peer_id local_peer_id=$LOCAL_PEER_ID"
+        return 0
+    fi
+
+    if [ "$target_pubkey" != "$LOCAL_PUBLIC_KEY" ]; then
+        log warn "discard control: target_public_key mismatch local public key local_peer_id=$LOCAL_PEER_ID"
         return 0
     fi
 
@@ -867,15 +887,15 @@ handle_control_message() {
 # Inputs: Uses global topic prefix and local peer_id.
 # Outputs: Long-running loop; retries on subscription disconnect.
 control_and_observation_subscriber_loop() {
-    control_topic="$TOPIC_PREFIX/peer/$LOCAL_PEER_ID/control"
-    obs_topic="$TOPIC_PREFIX/peer/+/observation"
+    local control_topic="$TOPIC_PREFIX/peer/$LOCAL_PEER_ID/control"
+    local obs_topic="$TOPIC_PREFIX/peer/+/observation"
 
     log info "subscribing topics: $control_topic, $obs_topic"
 
     while true; do
         mqtt_subscribe_stream "$control_topic" "$obs_topic" | while IFS= read -r line; do
-            topic="${line%% *}"
-            payload="${line#* }"
+            local topic="${line%% *}"
+            local payload="${line#* }"
 
             if [ "$topic" = "$control_topic" ]; then
                 handle_control_message "$payload"
@@ -902,16 +922,16 @@ ensure_local_peer_record() {
 # Inputs: $1 = peer public key, $2 = endpoint, $3 = latest_handshake, $4 = handshake_age, $5 = persistent_keepalive.
 # Outputs: Updates cache state and may trigger activate_peer.
 reconcile_peer_state() {
-    peer_pubkey="$1"
-    endpoint="$2"
-    latest_hs="$3"
-    hs_age="$4"
-    keepalive="$5"
+    local peer_pubkey="$1"
+    local endpoint="$2"
+    local latest_hs="$3"
+    local hs_age="$4"
+    local keepalive="$5"
 
-    now_epoch="$(date +%s)"
-    peer_id="$(calc_peer_id "$peer_pubkey")"
+    local now_epoch="$(date +%s)"
+    local peer_id="$(calc_peer_id "$peer_pubkey")"
 
-    state="IDLE"
+    local state="IDLE"
 
     if [ "$latest_hs" -gt 0 ] && [ "$hs_age" -lt "$ENDPOINT_TIMEOUT" ]; then
         state="CONNECTED"
@@ -919,7 +939,7 @@ reconcile_peer_state() {
         state="STALE"
     else
         if [ "$endpoint" != "(none)" ] || { [ "$keepalive" != "off" ] && [ "$keepalive" != "0" ]; }; then
-            started="$(cache_get_num "$peer_id" "activation_started_at")"
+            local started="$(cache_get_num "$peer_id" "activation_started_at")"
             if [ "$started" -gt 0 ] && [ $((now_epoch - started)) -gt "$FAILED_TIMEOUT" ]; then
                 state="FAILED"
             else
@@ -986,7 +1006,7 @@ peer_sync_loop() {
 
         if [ -n "$DETECTOR_PEER_IDS" ]; then
             split_detector_peer_ids "$DETECTOR_PEER_IDS" | while IFS= read -r detector_peer_id; do
-                log debug "checking detector peer_id=$detector_peer_id"
+                #log debug "checking detector peer_id=$detector_peer_id"
                 detector_pubkey="$(cache_get_str "$detector_peer_id" "public_key")"
                 if [ -n "$detector_pubkey" ]; then
                     detector_state="$(cache_get_str "$detector_peer_id" "state")"
@@ -1032,7 +1052,7 @@ cleanup() {
 # Inputs: Signal name as $1.
 # Outputs: Performs cleanup and exits 0.
 handle_termination() {
-    sig="$1"
+    local sig="$1"
     log info "received signal: $sig"
     cleanup
     exit 0

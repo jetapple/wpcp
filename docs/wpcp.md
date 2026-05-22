@@ -244,6 +244,8 @@ Payload:
 
   "public_key": "source_wireguard_public_key",
 
+  "target_public_key": "target_wireguard_public_key",
+
   "reason": "peer-request|endpoint-detection|<custom>",
 
   "family": "ipv4|ipv6" 
@@ -258,6 +260,7 @@ Receivers SHOULD verify:
 
 ```text
 peer_id == hash(public_key)
+local_peer_id == hash(target_public_key)
 ```
 
 before processing.
@@ -292,11 +295,15 @@ Payload:
 
   "public_key": "source_wireguard_public_key",
 
+  "target_public_key": "target_wireguard_public_key",
+
   "reason": "peer-request|endpoint-detection|<custom>"
 }
 ```
 
 `reason` is optional. It carries deactivation intent/context for observability and policy decisions. If absent, receiver SHOULD treat it as `remote-request`.
+
+`target_public_key` is required. Receiver MUST verify it matches local peer identity before processing.
 
 Meaning:
 
@@ -888,6 +895,8 @@ Peers SHOULD subscribe only to:
     
 
 Global subscriptions SHOULD be avoided in large deployments.
+
+Control message receivers MUST reject payloads missing `target_public_key`, and MUST reject payloads where `target_public_key` does not bind to the receiver peer identity.
 
 ---
 

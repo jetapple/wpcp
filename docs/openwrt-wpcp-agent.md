@@ -25,6 +25,7 @@ This document describes the OpenWRT-compatible implementation in:
 - Supports foreground run and OpenWRT procd service mode.
 - For control `activate`/`deactivate` messages, optional payload field `reason` is supported for intent/context propagation; if absent on receive, it defaults to `remote-request`.
 - For control `activate` messages, optional payload field `family` (`ipv4`/`ipv6`) is supported and propagated when relaying activate requests.
+- For control `activate`/`deactivate` messages, payload field `target_public_key` is required and validated on receive against local peer identity.
 
 ## Dependencies
 
