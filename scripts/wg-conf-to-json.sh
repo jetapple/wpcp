@@ -200,112 +200,129 @@ collect_linux() {
 # Use UCI to read WireGuard interfaces and their peers; skip disabled peers.
 # ---------------------------------------------------------------------------
 collect_openwrt() {
-    # Discover WireGuard interface names:
-    # sections of type 'interface' whose proto option equals 'wireguard'
+    # One-pass UCI parsing to avoid repeated scans and per-field awk processes.
     uci_dump="$(uci show network 2>/dev/null)"
+    field_sep="$(printf '\036')"
+    col_sep="$(printf '\037')"
 
-    uci_get_first() {
-        key="$1"
-        printf '%s\n' "$uci_dump" \
-            | awk -v k="$key" '
-                {
-                    p = index($0, "=")
-                    if (p <= 0) next
-                    lk = substr($0, 1, p - 1)
-                    if (lk == k) {
-                        v = substr($0, p + 1)
-                        gsub("\047", "", v)
-                        print v
-                        exit
+    printf '%s\n' "$uci_dump" | awk -v FSSEP="$field_sep" -v COLSEP="$col_sep" '
+        BEGIN {
+            prefix = "network."
+            pfxlen = length(prefix)
+        }
+        {
+            p = index($0, "=")
+            if (p <= 0) next
+
+            key = substr($0, 1, p - 1)
+            val = substr($0, p + 1)
+            gsub("\047", "", val)
+
+            if (index(key, prefix) != 1) next
+            rest = substr(key, pfxlen + 1)
+            dot = index(rest, ".")
+
+            if (dot == 0) {
+                sec = rest
+                section_type[sec] = val
+                section_order[++section_count] = sec
+            } else {
+                sec = substr(rest, 1, dot - 1)
+                opt = substr(rest, dot + 1)
+                k = sec SUBSEP opt
+                if (opt == "allowed_ips") {
+                    if (k in section_opt && section_opt[k] != "") {
+                        section_opt[k] = section_opt[k] FSSEP val
+                    } else {
+                        section_opt[k] = val
                     }
+                } else {
+                    section_opt[k] = val
                 }
-            '
-    }
+            }
+        }
+        END {
+            # First pass: resolve wireguard interfaces and preserve discovery order
+            for (i = 1; i <= section_count; i++) {
+                sec = section_order[i]
+                if (section_type[sec] != "interface") continue
 
-    uci_get_all() {
-        key="$1"
-        printf '%s\n' "$uci_dump" \
-            | awk -v k="$key" '
-                {
-                    p = index($0, "=")
-                    if (p <= 0) next
-                    lk = substr($0, 1, p - 1)
-                    if (lk == k) {
-                        v = substr($0, p + 1)
-                        gsub("\047", "", v)
-                        print v
-                    }
+                proto = section_opt[sec SUBSEP "proto"]
+                if (proto != "wireguard") continue
+
+                ifname = section_opt[sec SUBSEP "ifname"]
+                if (ifname == "") ifname = sec
+
+                if (!(ifname in iface_seen)) {
+                    iface_seen[ifname] = 1
+                    iface_order[++iface_count] = ifname
+                    print "I" COLSEP ifname
                 }
-            '
-    }
+            }
 
-    # network.<section>=interface  → check network.<section>.proto=wireguard
-    echo "$uci_dump" | grep "=interface$" | while IFS= read -r iface_line; do
-        section="$(printf '%s' "$iface_line" | cut -d= -f1)"   # network.<s>
-        proto_val="$(uci_get_first "${section}.proto")"
-        [ "$proto_val" = "wireguard" ] || continue
-        # The actual Linux interface name may be set via option ifname or defaults to section name
-        ifname_val="$(uci_get_first "${section}.ifname")"
-        if [ -z "$ifname_val" ]; then
-            # Default: UCI section name (strip 'network.' prefix)
-            ifname_val="$(printf '%s' "$section" | sed 's/^network\.//')"
-        fi
-        printf '%s\n' "$ifname_val"
-    done | sort -u | while IFS= read -r ifname; do
-        printf '%s\n' "$(jq -cn --arg ifname "$ifname" '{ifname:$ifname}')"
+            # Second pass: emit peer rows linked to existing wireguard interfaces
+            for (i = 1; i <= section_count; i++) {
+                sec = section_order[i]
+                typ = section_type[sec]
+                if (index(typ, "wireguard_") != 1) continue
 
-        # Find peer sections: type 'wireguard_<ifname>'
-        section_type="wireguard_${ifname}"
-        echo "$uci_dump" | grep "=${section_type}$" | while IFS= read -r peer_line; do
-            peer_section="$(printf '%s' "$peer_line" | cut -d= -f1)"  # network.<ps>
+                ifname = substr(typ, 11)
+                if (!(ifname in iface_seen)) continue
 
-            # Skip disabled peers
-            disabled_val="$(uci_get_first "${peer_section}.disabled")"
-            case "$disabled_val" in
-                1|true|yes|on) continue ;;
-            esac
-
-            pubkey="$(uci_get_first "${peer_section}.public_key")"
-            [ -z "$pubkey" ] && continue
-
-            peer_id="$(calc_peer_id "$pubkey")"
-            [ -z "$peer_id" ] && continue
-
-            # Collect allowed_ips list entries
-            ips_json="$(uci_get_all "${peer_section}.allowed_ips" | jq -Rsc 'split("\n") | map(select(length > 0))')"
-            [ -z "$ips_json" ] && ips_json="[]"
-
-            ep_host="$(uci_get_first "${peer_section}.endpoint_host")"
-            ep_port="$(uci_get_first "${peer_section}.endpoint_port")"
-            endpoint=""
-            if [ -n "$ep_host" ] && [ -n "$ep_port" ]; then
-                # IPv6 host needs brackets
-                case "$ep_host" in
-                    *:*) endpoint="[${ep_host}]:${ep_port}" ;;
-                    *)   endpoint="${ep_host}:${ep_port}" ;;
+                print "P" COLSEP ifname COLSEP \
+                      section_opt[sec SUBSEP "public_key"] COLSEP \
+                      section_opt[sec SUBSEP "disabled"] COLSEP \
+                      section_opt[sec SUBSEP "endpoint_host"] COLSEP \
+                      section_opt[sec SUBSEP "endpoint_port"] COLSEP \
+                      section_opt[sec SUBSEP "persistent_keepalive"] COLSEP \
+                      section_opt[sec SUBSEP "description"] COLSEP \
+                      section_opt[sec SUBSEP "allowed_ips"]
+            }
+        }
+    ' | while IFS="$col_sep" read -r rec_type ifname pubkey disabled_val ep_host ep_port keepalive description allowed_raw; do
+        case "$rec_type" in
+            I)
+                printf '%s\n' "$(jq -cn --arg ifname "$ifname" '{ifname:$ifname}')"
+                ;;
+            P)
+                case "$disabled_val" in
+                    1|true|yes|on) continue ;;
                 esac
-            fi
 
-            keepalive="$(uci_get_first "${peer_section}.persistent_keepalive")"
-            description="$(uci_get_first "${peer_section}.description")"
+                [ -z "$pubkey" ] && continue
+                peer_id="$(calc_peer_id "$pubkey")"
+                [ -z "$peer_id" ] && continue
 
-            obj="$(jq -cn \
-                --arg pk "$pubkey" \
-                --argjson ips "$ips_json" \
-                --arg ep "$endpoint" \
-                --arg ka "$keepalive" \
-                --arg desc "$description" \
-                '{public_key:$pk, allowed_ips:$ips}
-                 + (if $ep != "" then {endpoint:$ep} else {} end)
-                 + (if $ka != "" then {persistent_keepalive:($ka|tonumber)} else {} end)
-                 + (if $desc != "" then {description:$desc} else {} end)')"
+                endpoint=""
+                if [ -n "$ep_host" ] && [ -n "$ep_port" ]; then
+                    # IPv6 host needs brackets
+                    case "$ep_host" in
+                        *:*) endpoint="[${ep_host}]:${ep_port}" ;;
+                        *)   endpoint="${ep_host}:${ep_port}" ;;
+                    esac
+                fi
 
-            printf '%s\n' "$(jq -cn \
-                --arg ifname "$ifname" \
-                --arg pid "$peer_id" \
-                --argjson obj "$obj" \
-                '{ifname:$ifname,peer_id:$pid,obj:$obj}')"
-        done
+                printf '%s\n' "$(jq -cn \
+                    --arg ifname "$ifname" \
+                    --arg pid "$peer_id" \
+                    --arg pk "$pubkey" \
+                    --arg ips_raw "$allowed_raw" \
+                    --arg sep "$field_sep" \
+                    --arg ep "$endpoint" \
+                    --arg ka "$keepalive" \
+                    --arg desc "$description" \
+                    '{
+                        ifname:$ifname,
+                        peer_id:$pid,
+                        obj:(
+                            {public_key:$pk, allowed_ips:(if $ips_raw == "" then [] else ($ips_raw | split($sep) | map(select(length > 0))) end)}
+                            + (if $ep != "" then {endpoint:$ep} else {} end)
+                            + (if $ka != "" then {persistent_keepalive:($ka|tonumber)} else {} end)
+                            + (if $desc != "" then {description:$desc} else {} end)
+                        )
+                    }')"
+                ;;
+        esac
     done
 }
 
