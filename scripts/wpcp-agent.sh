@@ -29,6 +29,9 @@ CACHE_FILE=""
 CACHE_LOCK_DIR=""
 LOG_LEVEL="info"
 DETECTOR_PEER_IDS=""
+CONFIG_FILE=""
+CONFIG_DATA='{}'
+CONFIG_READY="0"
 
 LOCAL_PUBLIC_KEY=""
 LOCAL_PEER_ID=""
@@ -52,6 +55,7 @@ Required:
 Optional:
   -e, --endpoint ADDR          Explicit local public endpoint (host:port or [v6]:port; use none to disable)
   -d, --detector PEER_IDS      Peers to assist with endpoint detection, separated by ',' (optional)
+  -c, --config PATH            WireGuard config JSON file (default: disabled)
   -p, --port PORT              MQTT port (default: 1883)
       --username USER          MQTT username
       --password PASS          MQTT password
@@ -280,6 +284,10 @@ parse_args() {
                 DETECTOR_PEER_IDS="$val"
                 shift 2
                 ;;
+            -c|--config)
+                CONFIG_FILE="$val"
+                shift 2
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -404,6 +412,100 @@ cache_get_num() {
     jq -r --arg pid "$pid" --arg key "$key" '.peers[$pid][$key] // 0' "$CACHE_FILE" 2>/dev/null
 }
 
+# Function: config_reload
+# Purpose: Reload peer policy config from disk into memory.
+# Inputs: Uses CONFIG_FILE and WG_INTERFACE globals.
+# Outputs: Updates CONFIG_DATA/CONFIG_READY; returns 0 on successful load.
+config_reload() {
+    [ -n "$CONFIG_FILE" ] || return 1
+
+    if [ ! -r "$CONFIG_FILE" ]; then
+        log warn "cannot read config file: $CONFIG_FILE"
+        return 1
+    fi
+
+    local parsed
+    parsed="$(jq -c . "$CONFIG_FILE" 2>/dev/null)" || {
+        log warn "invalid JSON in config file: $CONFIG_FILE"
+        return 1
+    }
+
+    CONFIG_DATA="$parsed"
+    CONFIG_READY="1"
+    return 0
+}
+
+# Function: config_enforced
+# Purpose: Tell whether config-based peer policy is currently enforceable.
+# Inputs: Uses CONFIG_FILE and CONFIG_READY globals.
+# Outputs: Returns 0 if policy enforcement is active.
+config_enforced() {
+    [ -n "$CONFIG_FILE" ] && [ "$CONFIG_READY" = "1" ]
+}
+
+# Function: config_has_peer
+# Purpose: Check whether a peer_id exists in current interface config.
+# Inputs: $1 = peer_id.
+# Outputs: Returns 0 if present in config.
+config_has_peer() {
+    local pid="$1"
+    printf '%s' "$CONFIG_DATA" | jq -e --arg iface "$WG_INTERFACE" --arg pid "$pid" '.[$iface][$pid] != null' >/dev/null 2>&1
+}
+
+# Function: config_get_peer_public_key
+# Purpose: Read configured public_key for peer_id.
+# Inputs: $1 = peer_id.
+# Outputs: Echoes configured public_key or empty string.
+config_get_peer_public_key() {
+    local pid="$1"
+    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '.[$iface][$pid].public_key // ""' 2>/dev/null
+}
+
+# Function: config_get_peer_allowed_ips
+# Purpose: Read configured allowed_ips as a wg-compatible comma list.
+# Inputs: $1 = peer_id.
+# Outputs: Echoes comma-separated allowed_ips or empty string.
+config_get_peer_allowed_ips() {
+    local pid="$1"
+    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '
+        .[$iface][$pid].allowed_ips // empty
+        | if type == "array" then
+            map(select(type == "string" and length > 0)) | join(",")
+          elif type == "string" then
+            .
+          else
+            ""
+          end
+    ' 2>/dev/null
+}
+
+# Function: enforce_config_allowlist
+# Purpose: Remove runtime WG peers missing from the configured interface allowlist.
+# Inputs: Uses WG interface state and config globals.
+# Outputs: Removes disallowed peers and updates cache state.
+enforce_config_allowlist() {
+    config_enforced || return 0
+
+    wg show "$WG_INTERFACE" peers | while IFS= read -r peer_pubkey; do
+        [ -n "$peer_pubkey" ] || continue
+
+        local peer_id="$(calc_peer_id "$peer_pubkey")"
+        if is_detector_peer_id "$peer_id"; then
+            continue
+        fi
+
+        if ! config_has_peer "$peer_id"; then
+            log warn "config enforcement: removing peer_id=$peer_id not present in $CONFIG_FILE"
+            if wg set "$WG_INTERFACE" peer "$peer_pubkey" remove; then
+                cache_clear_activation_started "$peer_id" || true
+                cache_set_state "$peer_id" "INACTIVE" || true
+            else
+                log warn "config enforcement: failed removing peer_id=$peer_id"
+            fi
+        fi
+    done
+}
+
 # Function: detect_endpoint_family
 # Purpose: Classify endpoint string as ipv4/ipv6/none/unknown.
 # Inputs: $1 = endpoint string from wg or observation.
@@ -453,6 +555,19 @@ split_detector_peer_ids() {
         [ -n "$detector_peer_id" ] || continue
         printf '%s\n' "$detector_peer_id"
     done
+}
+
+# Function: is_detector_peer_id
+# Purpose: Check whether a peer_id is listed in detector peers.
+# Inputs: $1 = peer_id.
+# Outputs: Returns 0 if peer_id is configured as detector.
+is_detector_peer_id() {
+    local pid="$1"
+
+    [ -n "$pid" ] || return 1
+    [ -n "$DETECTOR_PEER_IDS" ] || return 1
+
+    split_detector_peer_ids "$DETECTOR_PEER_IDS" | grep -Fxq "$pid"
 }
 
 # Function: cache_ensure_peer
@@ -746,16 +861,43 @@ activate_peer() {
     local family="${4:-auto}"
     log debug "activating peer_id=$remote_peer_id reason=$reason family=$family"
 
+    local allowed_ips=""
+    if config_enforced && ! is_detector_peer_id "$remote_peer_id"; then
+        if ! config_has_peer "$remote_peer_id"; then
+            log warn "activate blocked by config: peer_id=$remote_peer_id not present in $CONFIG_FILE"
+            return 1
+        fi
+
+        local config_pubkey="$(config_get_peer_public_key "$remote_peer_id")"
+        if [ -z "$config_pubkey" ] || [ "$config_pubkey" != "$remote_pubkey" ]; then
+            log warn "activate blocked by config: peer_id/public_key mismatch peer_id=$remote_peer_id"
+            return 1
+        fi
+
+        allowed_ips="$(config_get_peer_allowed_ips "$remote_peer_id")"
+        log debug "config enforcement: allowing peer_id=$remote_peer_id with allowed_ips='$allowed_ips'"
+    fi
+
     local endpoint="$(select_activation_endpoint "$remote_peer_id" "$family")"
 
     if [ -n "$endpoint" ]; then
-        if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" endpoint "$endpoint" persistent-keepalive "$KEEPALIVE_ACTIVE"; then
+        if [ -n "$allowed_ips" ]; then
+            if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" endpoint "$endpoint" persistent-keepalive "$KEEPALIVE_ACTIVE" allowed-ips "$allowed_ips"; then
+                log warn "wg set activate failed peer_id=$remote_peer_id endpoint=$endpoint allowed_ips=$allowed_ips"
+                return 1
+            fi
+        elif ! wg set "$WG_INTERFACE" peer "$remote_pubkey" endpoint "$endpoint" persistent-keepalive "$KEEPALIVE_ACTIVE"; then
             log warn "wg set activate failed peer_id=$remote_peer_id endpoint=$endpoint"
             return 1
         fi
     else
         log debug "activate peer_id=$remote_peer_id: no endpoint in cache, adding peer without endpoint"
-        if ! wg set "$WG_INTERFACE" peer "$remote_pubkey"; then
+        if [ -n "$allowed_ips" ]; then
+            if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" allowed-ips "$allowed_ips"; then
+                log warn "wg set activate failed peer_id=$remote_peer_id allowed_ips=$allowed_ips"
+                return 1
+            fi
+        elif ! wg set "$WG_INTERFACE" peer "$remote_pubkey"; then
             log warn "wg set activate failed peer_id=$remote_peer_id (no endpoint)"
             return 1
         fi
@@ -830,6 +972,16 @@ handle_observation_message() {
 handle_control_message() {
     local payload="$1"
 
+    if [ -n "$CONFIG_FILE" ]; then
+        if config_reload; then
+            log debug "reloaded config file (control path): $CONFIG_FILE"
+        elif [ "$CONFIG_READY" != "1" ]; then
+            log warn "control path: config not ready yet: $CONFIG_FILE; policy checks skipped for this message"
+        else
+            log warn "control path: using last valid config snapshot from $CONFIG_FILE"
+        fi
+    fi
+
     local msg_type="$(printf '%s' "$payload" | jq -r '.type // empty')"
     local source_peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
     local source_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
@@ -865,6 +1017,19 @@ handle_control_message() {
     if [ "$target_pubkey" != "$LOCAL_PUBLIC_KEY" ]; then
         log warn "discard control: target_public_key mismatch local public key local_peer_id=$LOCAL_PEER_ID"
         return 0
+    fi
+
+    if config_enforced && ! is_detector_peer_id "$source_peer_id"; then
+        if ! config_has_peer "$source_peer_id"; then
+            log warn "discard control: peer_id=$source_peer_id not present in $CONFIG_FILE"
+            return 0
+        fi
+
+        local config_pubkey="$(config_get_peer_public_key "$source_peer_id")"
+        if [ -z "$config_pubkey" ] || [ "$config_pubkey" != "$source_pubkey" ]; then
+            log warn "discard control: config public_key mismatch peer_id=$source_peer_id"
+            return 0
+        fi
     fi
 
     cache_ensure_peer "$source_peer_id" "$source_pubkey" || true
@@ -970,6 +1135,16 @@ reconcile_peer_state() {
 # Outputs: Long-running loop that updates cache, reconciles state, and publishes observation.
 peer_sync_loop() {
     while true; do
+        if [ -n "$CONFIG_FILE" ]; then
+            if config_reload; then
+                log debug "reloaded config file: $CONFIG_FILE"
+            elif [ "$CONFIG_READY" != "1" ]; then
+                log warn "config not ready yet: $CONFIG_FILE; policy checks skipped for this cycle"
+            else
+                log warn "using last valid config snapshot from $CONFIG_FILE"
+            fi
+        fi
+
         ensure_local_peer_record
 
         now_epoch="$(date -u +%s)"
@@ -1003,6 +1178,8 @@ peer_sync_loop() {
         if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
             publish_observation_for_peer "$LOCAL_PUBLIC_KEY" "$LOCAL_PEER_ID" "$EXPLICIT_ENDPOINT" "0" "0"
         fi
+
+        enforce_config_allowlist
 
         if [ -n "$DETECTOR_PEER_IDS" ]; then
             split_detector_peer_ids "$DETECTOR_PEER_IDS" | while IFS= read -r detector_peer_id; do
@@ -1077,6 +1254,14 @@ main() {
 
     cache_init
     ensure_local_peer_record
+
+    if [ -n "$CONFIG_FILE" ]; then
+        if config_reload; then
+            log debug "initial config load: $CONFIG_FILE"
+        else
+            log warn "initial config load failed: $CONFIG_FILE; policy checks may be skipped until reload succeeds"
+        fi
+    fi
 
     if [ -n "$EXPLICIT_ENDPOINT" ] && [ "$EXPLICIT_ENDPOINT" != "none" ]; then
         cache_set_endpoint "$LOCAL_PEER_ID" "$LOCAL_PUBLIC_KEY" "$EXPLICIT_ENDPOINT" "$LOCAL_PEER_ID" "$WG_INTERFACE" "0" "0" || true
