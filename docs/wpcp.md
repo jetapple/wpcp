@@ -339,7 +339,7 @@ Payload:
 
   "latest_handshake": 1750000000,
 
-  "handshake_age": 12,
+  "observed_at": 1750000012,
 
   "observed_by": "observer_peer_id",
 
@@ -789,7 +789,7 @@ Payload:
 
   "latest_handshake": 1750000000,
 
-  "handshake_age": 8,
+  "observed_at": 1750000008,
 
   "observed_by": "observer_peer_id",
 

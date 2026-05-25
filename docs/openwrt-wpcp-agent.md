@@ -10,13 +10,14 @@ This document describes the OpenWRT-compatible implementation in:
 - Monitors and controls a specified WireGuard interface.
 - Uses MQTT as WPCP control/observation bus.
 - Maintains local observation cache for all connection-related peers, including local peer.
-- Separates endpoint cache by IP family:
-  - `endpoint_v4`
-  - `endpoint_v6`
+- Stores endpoint cache as a per-family map:
+  - `endpoint.ipv4`
+  - `endpoint.ipv6`
+  - each family value is `{endpoint, observed_by, observed_at, interface, latest_handshake}`
 - Activation endpoint selection policy:
   - Optional `family` override is supported by activation flow:
-    - `ipv6`: select only target `endpoint_v6`.
-    - `ipv4`: select only target `endpoint_v4`.
+    - `ipv6`: select only target `endpoint.ipv6.endpoint`.
+    - `ipv4`: select only target `endpoint.ipv4.endpoint`.
     - other/empty: use auto policy below.
   - If both local peer and target peer have cached IPv6 endpoints, use target IPv6 first.
   - Otherwise prefer target IPv4.
@@ -47,6 +48,8 @@ chmod +x /usr/bin/wpcp-agent.sh
 /usr/bin/wpcp-agent.sh \
   --interface wg0 \
   --broker 10.0.0.10 \
+  --config /etc/wpcp/wg0-peers.json \
+  --auto 1 \
   --port 1883 \
   --username mqtt_user \
   --password mqtt_pass \
@@ -81,6 +84,8 @@ config instance 'main'
     option password 'mqtt_pass'
     option tls '0'
     option topic_prefix 'wg'
+    option config '/etc/wg-conf.json'
+    option auto '1'
     option state_interval '15'
     option endpoint_timeout '180'
     option failed_timeout '30'
@@ -138,15 +143,27 @@ config instance 'main'
     option cache_file '/var/cache/wpcp-wg0.json'
 ```
 
+### Config Peer Auto-Management
+
+- `option config '<PATH>'` — Path to the WireGuard peer policy JSON consumed by `--config`
+- `option auto '0|1'` — Enable automatic reconciliation of configured peers; `1` requires `option config` to be set
+
+Example:
+
+```uci
+config instance 'main'
+    # ... other options ...
+    option config '/etc/wg-conf.json'
+    option auto '1'
+```
+
 Each peer entry is keyed by WPCP `peer_id` and can contain:
 
 - `public_key`
-- `endpoint_v4`
-- `endpoint_v6`
+- `endpoint` map:
+  - `ipv4`: `{endpoint, observed_by, observed_at, interface, latest_handshake}`
+  - `ipv6`: `{endpoint, observed_by, observed_at, interface, latest_handshake}`
 - `latest_handshake`
-- `handshake_age`
-- `observed_by`
-- `interface`
 - `state`
 - `activation_started_at`
 - `updated_at`
