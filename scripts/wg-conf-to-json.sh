@@ -16,7 +16,8 @@
 #         "public_key": "...",
 #         "allowed_ips": ["..."],
 #         "endpoint": "...",          # omitted if absent
-#         "persistent_keepalive": N   # omitted if absent
+#         "persistent_keepalive": N,  # omitted if absent
+#         "disabled": "0|1"          # omitted if absent
 #       }
 #     }
 #   }
@@ -94,89 +95,99 @@ calc_peer_id() {
 # ---------------------------------------------------------------------------
 parse_linux_conf() {
     conf="$1"
-    ifname="$(basename "$conf" .conf)"
+    ifname="${conf##*/}"
+    ifname="${ifname%.conf}"
+    field_sep="$(printf '\036')"
+    col_sep="$(printf '\037')"
 
-    in_peer=0
-    pubkey=""
-    allowed_ips=""
-    endpoint=""
-    keepalive=""
-    description=""
+    awk -v FSSEP="$field_sep" -v COLSEP="$col_sep" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        function flush_peer() {
+            if (pubkey == "") return
+            print "P" COLSEP pubkey COLSEP allowed_ips COLSEP endpoint COLSEP keepalive COLSEP description
+            pubkey = ""
+            allowed_ips = ""
+            endpoint = ""
+            keepalive = ""
+            description = ""
+        }
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            line = trim(line)
+            if (line == "") next
 
-    # Flush the accumulated peer block as a JSON line
-    flush_peer() {
-        [ -z "$pubkey" ] && return
+            low = tolower(line)
+            if (low == "[peer]") {
+                flush_peer()
+                in_peer = 1
+                next
+            }
+
+            if (substr(line, 1, 1) == "[") {
+                flush_peer()
+                in_peer = 0
+                next
+            }
+
+            if (!in_peer) next
+
+            p = index(line, "=")
+            if (p <= 0) next
+
+            key = trim(substr(line, 1, p - 1))
+            val = trim(substr(line, p + 1))
+
+            if (key == "PublicKey") {
+                pubkey = val
+            } else if (key == "AllowedIPs") {
+                if (allowed_ips == "") {
+                    allowed_ips = val
+                } else {
+                    allowed_ips = allowed_ips FSSEP val
+                }
+            } else if (key == "Endpoint") {
+                endpoint = val
+            } else if (key == "PersistentKeepalive") {
+                keepalive = val
+            } else if (key == "Description" || key == "description") {
+                description = val
+            }
+        }
+        END {
+            flush_peer()
+        }
+    ' "$conf" | while IFS="$col_sep" read -r rec_type pubkey allowed_raw endpoint keepalive description; do
+        [ "$rec_type" = "P" ] || continue
+        [ -z "$pubkey" ] && continue
+
         peer_id="$(calc_peer_id "$pubkey")"
-        [ -z "$peer_id" ] && return
-
-        # Build allowed_ips JSON array from comma-separated values.
-        # Use jq split/map so empty input is safely converted to [] without stderr noise.
-        ips_json="$(jq -cn --arg ips "$allowed_ips" '($ips | split(",") | map(gsub("^\\s+|\\s+$"; "") | select(length > 0)))')"
-
-        obj="$(jq -cn \
-            --arg pk "$pubkey" \
-            --argjson ips "$ips_json" \
-            --arg ep "$endpoint" \
-            --arg ka "$keepalive" \
-            --arg desc "$description" \
-            '{public_key:$pk, allowed_ips:$ips}
-             + (if $ep != "" then {endpoint:$ep} else {} end)
-             + (if $ka != "" then {persistent_keepalive:($ka|tonumber)} else {} end)
-             + (if $desc != "" then {description:$desc} else {} end)')"
+        [ -z "$peer_id" ] && continue
 
         printf '%s\n' "$(jq -cn \
             --arg ifname "$ifname" \
             --arg pid "$peer_id" \
-            --argjson obj "$obj" \
-            '{ifname:$ifname,peer_id:$pid,obj:$obj}')"
-    }
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        # Strip inline comments and leading/trailing whitespace
-        line="$(printf '%s' "$line" | sed 's/#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        [ -z "$line" ] && continue
-
-        case "$line" in
-            \[Peer\]|\[peer\])
-                flush_peer
-                in_peer=1
-                pubkey=""
-                allowed_ips=""
-                endpoint=""
-                keepalive=""
-                description=""
-                ;;
-            \[*)
-                flush_peer
-                in_peer=0
-                pubkey=""
-                allowed_ips=""
-                endpoint=""
-                keepalive=""
-                description=""
-                ;;
-            *)
-                [ "$in_peer" = "0" ] && continue
-                key="$(printf '%s' "$line" | cut -d= -f1 | sed 's/[[:space:]]*$//')"
-                val="$(printf '%s' "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//')"
-                case "$key" in
-                    PublicKey)           pubkey="$val" ;;
-                    AllowedIPs)
-                        if [ -z "$allowed_ips" ]; then
-                            allowed_ips="$val"
-                        else
-                            allowed_ips="${allowed_ips},${val}"
-                        fi
-                        ;;
-                    Endpoint)            endpoint="$val" ;;
-                    PersistentKeepalive) keepalive="$val" ;;
-                    Description|description) description="$val" ;;
-                esac
-                ;;
-        esac
-    done < "$conf"
-
-    flush_peer
+            --arg pk "$pubkey" \
+            --arg ips_raw "$allowed_raw" \
+            --arg sep "$field_sep" \
+            --arg ep "$endpoint" \
+            --arg ka "$keepalive" \
+            --arg desc "$description" \
+            '{
+                ifname:$ifname,
+                peer_id:$pid,
+                obj:(
+                    {public_key:$pk, allowed_ips:(if $ips_raw == "" then [] else ($ips_raw | split($sep) | map(gsub("^\\s+|\\s+$"; "") | select(length > 0))) end)}
+                    + (if $ep != "" then {endpoint:$ep} else {} end)
+                    + (if $ka != "" then {persistent_keepalive:($ka|tonumber)} else {} end)
+                    + (if $desc != "" then {description:$desc} else {} end)
+                )
+            }')"
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -188,7 +199,8 @@ collect_linux() {
     for conf in /etc/wireguard/*.conf; do
         [ -f "$conf" ] || continue
         found=1
-        ifname="$(basename "$conf" .conf)"
+        ifname="${conf##*/}"
+        ifname="${ifname%.conf}"
         printf '%s\n' "$(jq -cn --arg ifname "$ifname" '{ifname:$ifname}')"
         parse_linux_conf "$conf"
     done
@@ -197,7 +209,7 @@ collect_linux() {
 
 # ---------------------------------------------------------------------------
 # collect_openwrt
-# Use UCI to read WireGuard interfaces and their peers; skip disabled peers.
+# Use UCI to read WireGuard interfaces and their peers.
 # ---------------------------------------------------------------------------
 collect_openwrt() {
     # One-pass UCI parsing to avoid repeated scans and per-field awk processes.
@@ -255,7 +267,6 @@ collect_openwrt() {
 
                 if (!(ifname in iface_seen)) {
                     iface_seen[ifname] = 1
-                    iface_order[++iface_count] = ifname
                     print "I" COLSEP ifname
                 }
             }
@@ -285,10 +296,6 @@ collect_openwrt() {
                 printf '%s\n' "$(jq -cn --arg ifname "$ifname" '{ifname:$ifname}')"
                 ;;
             P)
-                case "$disabled_val" in
-                    1|true|yes|on) continue ;;
-                esac
-
                 [ -z "$pubkey" ] && continue
                 peer_id="$(calc_peer_id "$pubkey")"
                 [ -z "$peer_id" ] && continue
@@ -311,6 +318,7 @@ collect_openwrt() {
                     --arg ep "$endpoint" \
                     --arg ka "$keepalive" \
                     --arg desc "$description" \
+                    --arg dis "$disabled_val" \
                     '{
                         ifname:$ifname,
                         peer_id:$pid,
@@ -319,6 +327,7 @@ collect_openwrt() {
                             + (if $ep != "" then {endpoint:$ep} else {} end)
                             + (if $ka != "" then {persistent_keepalive:($ka|tonumber)} else {} end)
                             + (if $desc != "" then {description:$desc} else {} end)
+                            + (if $dis != "" then {disabled:$dis} else {} end)
                         )
                     }')"
                 ;;

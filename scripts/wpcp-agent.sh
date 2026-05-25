@@ -494,6 +494,27 @@ config_get_peer_allowed_ips() {
     ' 2>/dev/null
 }
 
+# Function: config_get_peer_disabled
+# Purpose: Read configured disabled flag for peer_id.
+# Inputs: $1 = peer_id.
+# Outputs: Echoes raw disabled value, defaults to 0 when unspecified.
+config_get_peer_disabled() {
+    local pid="$1"
+    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '
+        .[$iface][$pid].disabled // 0
+    ' 2>/dev/null
+}
+
+# Function: config_peer_is_disabled
+# Purpose: Tell whether config marks peer_id as disabled.
+# Inputs: $1 = peer_id.
+# Outputs: Returns 0 when disabled=1, else returns 1.
+config_peer_is_disabled() {
+    local pid="$1"
+    local disabled_val="$(config_get_peer_disabled "$pid")"
+    [ "$disabled_val" = "1" ]
+}
+
 # Function: config_get_peers
 # Purpose: Enumerate peer IDs defined in the current interface config.
 # Inputs: None.
@@ -517,8 +538,8 @@ enforce_config_allowlist() {
             continue
         fi
 
-        if ! config_has_peer "$peer_id"; then
-            log warn "config enforcement: removing peer_id=$peer_id not present in $CONFIG_FILE"
+        if ! config_has_peer "$peer_id" || config_peer_is_disabled "$peer_id"; then
+            log warn "config enforcement: removing peer_id=$peer_id not present or disabled in $CONFIG_FILE"
             if ! deactivate_peer "$peer_id" "$peer_pubkey" "config-request"; then
                 log warn "config enforcement: failed removing peer_id=$peer_id"
             fi
@@ -785,6 +806,15 @@ auto_activate_configured_peers() {
             continue
         fi
 
+        if config_peer_is_disabled "$peer_id"; then
+            log debug "auto management: skip disabled peer_id=$peer_id"
+            if wg show "$WG_INTERFACE" peers | grep -Fxq "$peer_pubkey"; then
+                log info "auto management: deactivating disabled peer_id=$peer_id"
+                deactivate_peer "$peer_id" "$peer_pubkey" "config-disabled" || true
+            fi
+            continue
+        fi
+
         if wg show "$WG_INTERFACE" peers | grep -Fxq "$peer_pubkey"; then
             local peer_state="$(cache_get_state "$peer_id")"
             if [ "$peer_state" = "CONNECTED" ] || [ "$peer_state" = "ACTIVATING" ]; then
@@ -987,6 +1017,11 @@ activate_peer() {
         local config_pubkey="$(config_get_peer_public_key "$remote_peer_id")"
         if [ -z "$config_pubkey" ] || [ "$config_pubkey" != "$remote_pubkey" ]; then
             log warn "activate blocked by config: peer_id/public_key mismatch peer_id=$remote_peer_id"
+            return 1
+        fi
+
+        if config_peer_is_disabled "$remote_peer_id"; then
+            log warn "activate blocked by config: peer_id=$remote_peer_id is disabled"
             return 1
         fi
 
