@@ -320,6 +320,7 @@ parse_args() {
 # Outputs: No stdout on success; exits if a dependency is missing.
 setup_dependencies() {
     require_cmd wg
+    require_cmd ip
     require_cmd jq
     require_cmd mosquitto_pub
     require_cmd mosquitto_sub
@@ -492,6 +493,22 @@ config_get_peer_allowed_ips() {
             ""
           end
     ' 2>/dev/null
+}
+
+# Function: config_get_peer_assigned_ips
+# Purpose: Read configured address list as a comma-separated string.
+# Inputs: $1 = peer_id.
+# Outputs: Echoes comma-separated addresses or empty string.
+config_get_peer_assigned_ips() {
+        local pid="$1"
+        printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '
+                .[$iface][$pid].assigned_ips // []
+                | if type == "array" then
+                        map(select(type == "string" and length > 0)) | join(",")
+                    else
+                        ""
+                    end
+        ' 2>/dev/null
 }
 
 # Function: config_get_peer_disabled
@@ -996,6 +1013,78 @@ select_activation_endpoint() {
     echo ""
 }
 
+# Function: is_valid_interface_address
+# Purpose: Validate interface address syntax as CIDR-like token.
+# Inputs: $1 = address string.
+# Outputs: Returns 0 when syntax is acceptable.
+is_valid_interface_address() {
+    local address="$1"
+
+    [ -n "$address" ] || return 1
+    case "$address" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    case "$address" in
+        *[!0-9A-Fa-f:./]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Function: apply_peer_interface_addresses
+# Purpose: Add configured peer addresses to the local interface.
+# Inputs: $1 = peer_id, $2 = comma-separated addresses.
+# Outputs: Best-effort apply with warning logs on failures.
+apply_peer_interface_addresses() {
+    local remote_peer_id="$1"
+    local addresses_csv="$2"
+
+    [ -n "$addresses_csv" ] || return 0
+    log debug "applying interface addresses for peer_id=$remote_peer_id addresses='$addresses_csv'"
+
+    printf '%s\n' "$addresses_csv" | tr ',' '\n' | while IFS= read -r addr; do
+        [ -n "$addr" ] || continue
+
+        if ! is_valid_interface_address "$addr"; then
+            log warn "skip invalid address in config peer_id=$remote_peer_id address=$addr"
+            continue
+        fi
+
+        if ip addr add "$addr" dev "$WG_INTERFACE" >/dev/null 2>&1; then
+            log info "added interface address peer_id=$remote_peer_id address=$addr iface=$WG_INTERFACE"
+        else
+            log warn "failed to add interface address peer_id=$remote_peer_id address=$addr iface=$WG_INTERFACE"
+        fi
+    done
+}
+
+# Function: remove_peer_interface_addresses
+# Purpose: Remove tracked peer addresses from the local interface.
+# Inputs: $1 = peer_id, $2 = comma-separated addresses.
+# Outputs: Best-effort cleanup with warning logs on failures.
+remove_peer_interface_addresses() {
+    local remote_peer_id="$1"
+    local addresses_csv="$2"
+
+    [ -n "$addresses_csv" ] || return 0
+    log debug "removing interface addresses for peer_id=$remote_peer_id addresses='$addresses_csv'"
+
+    printf '%s\n' "$addresses_csv" | tr ',' '\n' | while IFS= read -r addr; do
+        [ -n "$addr" ] || continue
+
+        if ! is_valid_interface_address "$addr"; then
+            log warn "skip invalid address removal peer_id=$remote_peer_id address=$addr"
+            continue
+        fi
+
+        if ip addr del "$addr" dev "$WG_INTERFACE" >/dev/null 2>&1; then
+            log info "removed interface address peer_id=$remote_peer_id address=$addr iface=$WG_INTERFACE"
+        else
+            log warn "failed to remove interface address peer_id=$remote_peer_id address=$addr iface=$WG_INTERFACE"
+        fi
+    done
+}
+
 # Function: activate_peer
 # Purpose: Configure wg peer endpoint/keepalive and emit activate control.
 # Inputs: $1 = remote peer_id, $2 = remote public key, $3 = reason, $4 = family preference (optional).
@@ -1008,6 +1097,7 @@ activate_peer() {
     log debug "activating peer_id=$remote_peer_id reason=$reason family=$family"
 
     local allowed_ips=""
+    local assigned_ips=""
     if config_enforced && ! is_detector_peer_id "$remote_peer_id"; then
         if ! config_has_peer "$remote_peer_id"; then
             log warn "activate blocked by config: peer_id=$remote_peer_id not present in $CONFIG_FILE"
@@ -1026,7 +1116,8 @@ activate_peer() {
         fi
 
         allowed_ips="$(config_get_peer_allowed_ips "$remote_peer_id")"
-        log debug "config enforcement: allowing peer_id=$remote_peer_id with allowed_ips='$allowed_ips'"
+        assigned_ips="$(config_get_peer_assigned_ips "$remote_peer_id")"
+        log debug "config enforcement: allowing peer_id=$remote_peer_id with allowed_ips='$allowed_ips' and assigned_ips='$assigned_ips'"
     fi
 
     local endpoint="$(select_activation_endpoint "$remote_peer_id" "$family")"
@@ -1054,6 +1145,10 @@ activate_peer() {
         fi
     fi
 
+    if [ -n "$assigned_ips" ]; then
+        apply_peer_interface_addresses "$remote_peer_id" "$assigned_ips"
+    fi
+
     cache_set_activation_started "$remote_peer_id" || true
     cache_set_state "$remote_peer_id" "ACTIVATING" || true
     if [ "$reason" != "peer-request" ]; then
@@ -1077,6 +1172,11 @@ deactivate_peer() {
     if ! wg set "$WG_INTERFACE" peer "$remote_pubkey" remove; then
         log warn "wg set deactivate failed peer_id=$remote_peer_id"
         return 1
+    fi
+
+    if config_enforced && config_has_peer "$remote_peer_id"; then
+        local assigned_ips="$(config_get_peer_assigned_ips "$remote_peer_id")"
+        remove_peer_interface_addresses "$remote_peer_id" "$assigned_ips"
     fi
 
     cache_clear_activation_started "$remote_peer_id" || true

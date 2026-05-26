@@ -110,6 +110,17 @@ Default cache file:
 /tmp/wpcp-<interface>-cache.json
 ```
 
+Each peer entry is keyed by WPCP `peer_id` and can contain:
+
+- `public_key`
+- `endpoint` map:
+  - `ipv4`: `{endpoint, observed_by, observed_at, interface, latest_handshake}`
+  - `ipv6`: `{endpoint, observed_by, observed_at, interface, latest_handshake}`
+- `latest_handshake`
+- `state`
+- `activation_started_at`
+- `updated_at`
+
 ## Optional Configuration Parameters
 
 In addition to the required and shown parameters above, the following optional parameters are supported:
@@ -148,25 +159,49 @@ config instance 'main'
 - `option config '<PATH>'` — Path to the WireGuard peer policy JSON consumed by `--config`
 - `option auto '0|1'` — Enable automatic reconciliation of configured peers; `1` requires `option config` to be set
 
+The file referenced by `option config` (for example, `/etc/wpcp-conf.json`) is a per-interface peer policy map.
+
+- Top-level keys are WireGuard interface names (for example, `wg0`, `wg1`)
+- Each interface value is an object keyed by WPCP `peer_id`
+- Each peer object supports:
+  - `public_key` (required): peer WireGuard public key
+  - `allowed_ips` (optional): list of allowed IP CIDRs
+  - `description` (optional): free-text description
+  - `assigned_ips` (optional): list of assigned tunnel IP CIDRs
+  - `disabled` (optional): `"1"` to disable this peer in auto-management, `"0"` (or absent) to keep it enabled
+
+Example `/etc/wpcp-conf.json`:
+
+```json
+{
+  "wg0": {},
+  "wg1": {
+    "ugiujuhy6kon5zugsbpau3wuj4": {
+      "public_key": "HK+hq8Fkk1gbD07sYz/QpG8zMETCUu+3snLS6/EiVX8=",
+      "allowed_ips": [
+        "0.0.0.0/0"
+      ],
+      "description": "Homeport_Liu",
+      "assigned_ips": [
+        "10.13.23.10/24"
+      ],
+      "disabled": "0"
+    }
+  }
+}
+```
+
+In this example, `wg0` has no managed peers, while `wg1` manages one enabled peer.
+
 Example:
 
 ```uci
 config instance 'main'
     # ... other options ...
-    option config '/etc/wg-conf.json'
+    option config '/etc/wpcp-conf.json'
     option auto '1'
 ```
 
-Each peer entry is keyed by WPCP `peer_id` and can contain:
-
-- `public_key`
-- `endpoint` map:
-  - `ipv4`: `{endpoint, observed_by, observed_at, interface, latest_handshake}`
-  - `ipv6`: `{endpoint, observed_by, observed_at, interface, latest_handshake}`
-- `latest_handshake`
-- `state`
-- `activation_started_at`
-- `updated_at`
 
 ## Notes
 
