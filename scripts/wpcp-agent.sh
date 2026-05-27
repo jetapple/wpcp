@@ -27,11 +27,15 @@ QOS_CONTROL="1"
 QOS_OBSERVATION="0"
 CACHE_FILE=""
 CACHE_LOCK_DIR=""
+BINDING_CACHE_FILE=""
 LOG_LEVEL="info"
 DETECTOR_PEER_IDS=""
+DETECTOR_PEERS_LIST=""
+DETECTOR_PEERS_SET=""
 CONFIG_FILE=""
 CONFIG_DATA='{}'
 CONFIG_READY="0"
+CONFIG_MTIME=""
 AUTO_ACTIVATION="0"
 
 LOCAL_PUBLIC_KEY=""
@@ -312,6 +316,8 @@ parse_args() {
                 ;;
         esac
     done
+
+    refresh_detector_peer_cache
 }
 
 # Function: setup_dependencies
@@ -440,6 +446,12 @@ config_reload() {
         return 1
     fi
 
+    local config_mtime=""
+    config_mtime="$(stat -c %Y "$CONFIG_FILE" 2>/dev/null || true)"
+    if [ -n "$config_mtime" ] && [ "$CONFIG_READY" = "1" ] && [ "$CONFIG_MTIME" = "$config_mtime" ]; then
+        return 0
+    fi
+
     local parsed
     parsed="$(jq -c . "$CONFIG_FILE" 2>/dev/null)" || {
         log warn "invalid JSON in config file: $CONFIG_FILE"
@@ -448,6 +460,7 @@ config_reload() {
 
     CONFIG_DATA="$parsed"
     CONFIG_READY="1"
+    CONFIG_MTIME="$config_mtime"
     return 0
 }
 
@@ -542,12 +555,19 @@ config_get_peers() {
 
 # Function: enforce_config_allowlist
 # Purpose: Remove runtime WG peers missing from the configured interface allowlist.
-# Inputs: Uses WG interface state and config globals.
+# Inputs: $1 = WireGuard dump snapshot; uses config globals.
 # Outputs: Removes disallowed peers and updates cache state.
 enforce_config_allowlist() {
+    local wg_dump="$1"
     config_enforced || return 0
 
-    wg show "$WG_INTERFACE" peers | while IFS= read -r peer_pubkey; do
+    local _skip_header="1"
+    printf '%s\n' "$wg_dump" | while IFS="$(printf '\t')" read -r peer_pubkey _psk _endpoint _allowed _latest_hs _rx _tx _keepalive; do
+        if [ "$_skip_header" = "1" ]; then
+            _skip_header="0"
+            continue
+        fi
+
         [ -n "$peer_pubkey" ] || continue
 
         local peer_id="$(calc_peer_id "$peer_pubkey")"
@@ -590,29 +610,62 @@ detect_endpoint_family() {
             ;;
     esac
 
-    local colon_count="$(printf '%s' "$endpoint" | tr -cd ':' | wc -c | awk '{print $1}')"
-    if [ "$colon_count" -ge 2 ]; then
-        echo "ipv6"
-        return
-    fi
+    case "$endpoint" in
+        *:*:*)
+            echo "ipv6"
+            return
+            ;;
+    esac
 
     echo "unknown"
 }
 
 # Function: split_detector_peer_ids
 # Purpose: Split detector peer IDs by ',', trim whitespace, and ignore empty items.
-# Inputs: $1 = comma-separated detector peer IDs.
+# Inputs: Uses precomputed detector cache.
 # Outputs: Prints one normalized peer_id per line.
-split_detector_peer_ids() {
-    local detector_raw="$1"
+refresh_detector_peer_cache() {
+    DETECTOR_PEERS_LIST=""
+    DETECTOR_PEERS_SET="
+"
 
-    [ -n "$detector_raw" ] || return 0
+    [ -n "$DETECTOR_PEER_IDS" ] || return 0
 
-    printf '%s\n' "$detector_raw" | tr ',' '\n' | while IFS= read -r detector_peer_id; do
-        detector_peer_id="$(printf '%s' "$detector_peer_id" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    local detector_peer_id
+    local old_ifs="$IFS"
+    local had_noglob="0"
+
+    case "$-" in
+        *f*) had_noglob="1" ;;
+    esac
+
+    set -f
+    IFS=','
+    for detector_peer_id in $DETECTOR_PEER_IDS; do
+        detector_peer_id="${detector_peer_id#"${detector_peer_id%%[![:space:]]*}"}"
+        detector_peer_id="${detector_peer_id%"${detector_peer_id##*[![:space:]]}"}"
         [ -n "$detector_peer_id" ] || continue
-        printf '%s\n' "$detector_peer_id"
+
+        if [ -n "$DETECTOR_PEERS_LIST" ]; then
+            DETECTOR_PEERS_LIST="${DETECTOR_PEERS_LIST}
+$detector_peer_id"
+        else
+            DETECTOR_PEERS_LIST="$detector_peer_id"
+        fi
+
+        DETECTOR_PEERS_SET="${DETECTOR_PEERS_SET}${detector_peer_id}
+"
     done
+    IFS="$old_ifs"
+
+    if [ "$had_noglob" != "1" ]; then
+        set +f
+    fi
+}
+
+split_detector_peer_ids() {
+    [ -n "$DETECTOR_PEERS_LIST" ] || return 0
+    printf '%s\n' "$DETECTOR_PEERS_LIST"
 }
 
 # Function: is_detector_peer_id
@@ -623,9 +676,15 @@ is_detector_peer_id() {
     local pid="$1"
 
     [ -n "$pid" ] || return 1
-    [ -n "$DETECTOR_PEER_IDS" ] || return 1
+    [ -n "$DETECTOR_PEERS_LIST" ] || return 1
 
-    split_detector_peer_ids "$DETECTOR_PEER_IDS" | grep -Fxq "$pid"
+    case "$DETECTOR_PEERS_SET" in
+        *"
+$pid
+"*) return 0 ;;
+    esac
+
+    return 1
 }
 
 # Function: cache_ensure_peer
@@ -694,6 +753,101 @@ cache_set_endpoint() {
         --argjson latest_hs "$latest_hs" \
         --argjson now "$now_epoch" \
         '.peers[$pid] = ((.peers[$pid] // {}) + {public_key:$pubkey, latest_handshake:$latest_hs, updated_at:$now})'
+}
+
+# Function: cache_set_activation_started
+# Function: cache_upsert_observation
+# Purpose: Atomically ensure peer exists and update endpoint in a single cache write.
+# Inputs: $1 = peer_id, $2 = public key, $3 = endpoint, $4 = observed_by, $5 = interface, $6 = latest_handshake, $7 = observed_at.
+# Outputs: Returns cache_update_with_jq status.
+cache_upsert_observation() {
+    local pid="$1"
+    local pubkey="$2"
+    local endpoint="$3"
+    local observed_by="$4"
+    local obs_iface="$5"
+    local latest_hs="$6"
+    local observed_at="$7"
+
+    local family="$(detect_endpoint_family "$endpoint")"
+    local now_epoch="$(date -u +%s)"
+
+    if [ "$family" = "ipv4" ] || [ "$family" = "ipv6" ]; then
+        cache_update_with_jq \
+            --arg pid "$pid" \
+            --arg pubkey "$pubkey" \
+            --arg endpoint "$endpoint" \
+            --arg observed_by "$observed_by" \
+            --arg obs_iface "$obs_iface" \
+            --arg family "$family" \
+            --argjson latest_hs "$latest_hs" \
+            --argjson observed_at "$observed_at" \
+            --argjson now "$now_epoch" \
+            '.peers[$pid] = ((.peers[$pid] // {}) + {public_key:$pubkey, latest_handshake:$latest_hs, updated_at:$now} | .endpoint = (.endpoint // {}) | .endpoint[$family] = {endpoint:$endpoint, observed_by:$observed_by, observed_at:$observed_at, interface:$obs_iface, latest_handshake:$latest_hs})'
+        return
+    fi
+
+    cache_update_with_jq \
+        --arg pid "$pid" \
+        --arg pubkey "$pubkey" \
+        --argjson latest_hs "$latest_hs" \
+        --argjson now "$now_epoch" \
+        '.peers[$pid] = ((.peers[$pid] // {}) + {public_key:$pubkey, latest_handshake:$latest_hs, updated_at:$now})'
+}
+
+# Function: cache_upsert_peer_runtime
+# Purpose: Atomically persist peer runtime snapshot fields in one cache write.
+# Inputs: $1 = peer_id, $2 = public key, $3 = endpoint, $4 = latest_handshake, $5 = observed_at, $6 = state, $7 = clear activation_started flag (0/1).
+# Outputs: Returns cache_update_with_jq status.
+cache_upsert_peer_runtime() {
+        local pid="$1"
+        local pubkey="$2"
+        local endpoint="$3"
+        local latest_hs="$4"
+        local observed_at="$5"
+        local state="$6"
+        local clear_activation="${7:-0}"
+
+        local family="$(detect_endpoint_family "$endpoint")"
+
+        cache_update_with_jq \
+                --arg pid "$pid" \
+                --arg pubkey "$pubkey" \
+                --arg endpoint "$endpoint" \
+                --arg observed_by "$LOCAL_PEER_ID" \
+                --arg obs_iface "$WG_INTERFACE" \
+                --arg family "$family" \
+                --arg state "$state" \
+                --argjson latest_hs "$latest_hs" \
+                --argjson observed_at "$observed_at" \
+                --argjson now "$observed_at" \
+                --argjson clear_activation "$clear_activation" \
+                '.peers[$pid] = (
+                        ((.peers[$pid] // {}) + {
+                                public_key:$pubkey,
+                                latest_handshake:$latest_hs,
+                                updated_at:$now,
+                                state:$state,
+                                state_updated_at:$now
+                        })
+                        | .endpoint = (.endpoint // {})
+                        | if ($family == "ipv4" or $family == "ipv6") then
+                                .endpoint[$family] = {
+                                        endpoint:$endpoint,
+                                        observed_by:$observed_by,
+                                        observed_at:$observed_at,
+                                        interface:$obs_iface,
+                                        latest_handshake:$latest_hs
+                                }
+                            else
+                                .
+                            end
+                        | if $clear_activation == 1 then
+                                del(.activation_started_at)
+                            else
+                                .
+                            end
+                )'
 }
 
 # Function: cache_set_activation_started
@@ -804,9 +958,10 @@ peer_has_fresh_endpoint() {
 
 # Function: auto_activate_configured_peers
 # Purpose: Automatically keep config-defined peers in sync with wg state.
-# Inputs: Uses AUTO_ACTIVATION, CONFIG_DATA, WG_INTERFACE, cache, and wg runtime state.
+# Inputs: $1 = WireGuard dump snapshot; uses AUTO_ACTIVATION, CONFIG_DATA, WG_INTERFACE, and cache.
 # Outputs: Activates missing peers with fresh endpoints; deactivates peers in wg with bad state.
 auto_activate_configured_peers() {
+    local wg_dump="$1"
     [ "$AUTO_ACTIVATION" = "1" ] || return 0
     config_enforced || return 0
 
@@ -825,14 +980,14 @@ auto_activate_configured_peers() {
 
         if config_peer_is_disabled "$peer_id"; then
             log debug "auto management: skip disabled peer_id=$peer_id"
-            if wg show "$WG_INTERFACE" peers | grep -Fxq "$peer_pubkey"; then
+            if wg_dump_has_peer_pubkey "$wg_dump" "$peer_pubkey"; then
                 log info "auto management: deactivating disabled peer_id=$peer_id"
                 deactivate_peer "$peer_id" "$peer_pubkey" "config-disabled" || true
             fi
             continue
         fi
 
-        if wg show "$WG_INTERFACE" peers | grep -Fxq "$peer_pubkey"; then
+        if wg_dump_has_peer_pubkey "$wg_dump" "$peer_pubkey"; then
             local peer_state="$(cache_get_state "$peer_id")"
             if [ "$peer_state" = "CONNECTED" ] || [ "$peer_state" = "ACTIVATING" ]; then
                 log debug "auto management: keep peer_id=$peer_id state=$peer_state"
@@ -1196,24 +1351,37 @@ deactivate_peer() {
 handle_observation_message() {
     local payload="$1"
 
-    local peer_id="$(printf '%s' "$payload" | jq -r '.peer_id // empty')"
-    local peer_pubkey="$(printf '%s' "$payload" | jq -r '.public_key // empty')"
-    local endpoint="$(printf '%s' "$payload" | jq -r '.endpoint // empty')"
-    local latest_hs="$(printf '%s' "$payload" | jq -r '.latest_handshake // 0')"
-    local observed_at="$(printf '%s' "$payload" | jq -r '.observed_at // 0')"
-    local observed_by="$(printf '%s' "$payload" | jq -r '.observed_by // empty')"
-    local obs_iface="$(printf '%s' "$payload" | jq -r '.interface // empty')"
+    # O1: parse all fields in a single jq invocation
+    local _parsed
+    local peer_id peer_pubkey endpoint latest_hs observed_at observed_by obs_iface
+    _parsed="$(printf '%s' "$payload" | jq -r '[
+        .peer_id // "",
+        .public_key // "",
+        .endpoint // "",
+        (.latest_handshake // 0 | tostring),
+        (.observed_at // 0 | tostring),
+        .observed_by // "",
+        .interface // ""
+    ] | join("\t")')" || return 0
+    IFS="$(printf '\t')" read -r peer_id peer_pubkey endpoint latest_hs observed_at observed_by obs_iface <<OBSEOF
+$_parsed
+OBSEOF
 
     [ -n "$peer_id" ] || return 0
     [ -n "$peer_pubkey" ] || return 0
 
-    if ! verify_peer_binding "$peer_id" "$peer_pubkey"; then
-        log warn "discard observation: peer_id/public_key mismatch peer_id=$peer_id"
-        return 0
+    # O2: skip expensive crypto verify for already-validated peer_id/pubkey bindings
+    local _bkey="${peer_id}:${peer_pubkey}"
+    if ! grep -Fxq "$_bkey" "$BINDING_CACHE_FILE" 2>/dev/null; then
+        if ! verify_peer_binding "$peer_id" "$peer_pubkey"; then
+            log warn "discard observation: peer_id/public_key mismatch peer_id=$peer_id"
+            return 0
+        fi
+        printf '%s\n' "$_bkey" >> "$BINDING_CACHE_FILE"
     fi
 
-    cache_ensure_peer "$peer_id" "$peer_pubkey" || true
-    cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint" "$observed_by" "$obs_iface" "$latest_hs" "$observed_at" || true
+    # O3: single atomic cache write replacing cache_ensure_peer + cache_set_endpoint
+    cache_upsert_observation "$peer_id" "$peer_pubkey" "$endpoint" "$observed_by" "$obs_iface" "$latest_hs" "$observed_at" || true
 }
 
 # Function: handle_control_message
@@ -1333,19 +1501,36 @@ ensure_local_peer_record() {
     cache_ensure_peer "$LOCAL_PEER_ID" "$LOCAL_PUBLIC_KEY" || true
 }
 
+# Function: wg_dump_has_peer_pubkey
+# Purpose: Check whether a peer public key exists in a wg show dump snapshot.
+# Inputs: $1 = full wg dump text, $2 = peer public key.
+# Outputs: Returns 0 when peer key exists as a peer row in the snapshot.
+wg_dump_has_peer_pubkey() {
+    local wg_dump="$1"
+    local peer_pubkey="$2"
+
+    [ -n "$peer_pubkey" ] || return 1
+    case "
+$wg_dump
+" in
+        *"
+$peer_pubkey	"*) return 0 ;;
+    esac
+
+    return 1
+}
+
 # Function: reconcile_peer_state
 # Purpose: Compute peer state machine from wg runtime data and drive activation.
-# Inputs: $1 = peer public key, $2 = endpoint, $3 = latest_handshake, $4 = current handshake age, $5 = persistent_keepalive.
-# Outputs: Updates cache state and may trigger activate_peer.
+# Inputs: $1 = peer_id, $2 = endpoint, $3 = latest_handshake, $4 = current handshake age, $5 = persistent_keepalive, $6 = current epoch.
+# Outputs: Prints "state<TAB>clear_activation" where clear_activation is 0/1.
 reconcile_peer_state() {
-    local peer_pubkey="$1"
+    local peer_id="$1"
     local endpoint="$2"
     local latest_hs="$3"
     local hs_age="$4"
     local keepalive="$5"
-
-    local now_epoch="$(date -u +%s)"
-    local peer_id="$(calc_peer_id "$peer_pubkey")"
+    local now_epoch="$6"
 
     local state="IDLE"
 
@@ -1366,18 +1551,12 @@ reconcile_peer_state() {
         fi
     fi
 
-    cache_set_state "$peer_id" "$state" || true
+    local clear_activation="0"
+    if [ "$state" = "CONNECTED" ]; then
+        clear_activation="1"
+    fi
 
-    case "$state" in
-        CONNECTED)
-            cache_clear_activation_started "$peer_id" || true
-            ;;
-        IDLE|STALE|FAILED)
-            #activate_peer "$peer_id" "$peer_pubkey" "state-$state" || true
-            ;;
-        *)
-            ;;
-    esac
+    printf '%s\t%s\n' "$state" "$clear_activation"
 }
 
 # Function: peer_sync_loop
@@ -1399,8 +1578,20 @@ peer_sync_loop() {
         ensure_local_peer_record
 
         now_epoch="$(date -u +%s)"
+        wg_dump="$(wg show "$WG_INTERFACE" dump 2>/dev/null)"
+        if [ -z "$wg_dump" ]; then
+            log warn "failed to read wg dump for interface=$WG_INTERFACE"
+            sleep "$STATE_INTERVAL"
+            continue
+        fi
 
-        wg show "$WG_INTERFACE" dump | tail -n +2 | while IFS="$(printf '\t')" read -r peer_pubkey _psk endpoint _allowed latest_hs _rx _tx keepalive; do
+        local _skip_header="1"
+        printf '%s\n' "$wg_dump" | while IFS="$(printf '\t')" read -r peer_pubkey _psk endpoint _allowed latest_hs _rx _tx keepalive; do
+            if [ "$_skip_header" = "1" ]; then
+                _skip_header="0"
+                continue
+            fi
+
             [ -n "$peer_pubkey" ] || continue
 
             peer_id="$(calc_peer_id "$peer_pubkey")"
@@ -1414,12 +1605,15 @@ peer_sync_loop() {
                 hs_age=0
             fi
 
-            cache_ensure_peer "$peer_id" "$peer_pubkey" || true
-            if [ -n "$endpoint" ] && [ "$endpoint" != "(none)" ]; then
-                cache_set_endpoint "$peer_id" "$peer_pubkey" "$endpoint" "$LOCAL_PEER_ID" "$WG_INTERFACE" "$latest_hs" "$now_epoch" || true
-            fi
+            local _state_eval
+            local peer_state
+            local clear_activation
+            _state_eval="$(reconcile_peer_state "$peer_id" "$endpoint" "$latest_hs" "$hs_age" "$keepalive" "$now_epoch")"
+            IFS="$(printf '\t')" read -r peer_state clear_activation <<STATEEOF
+$_state_eval
+STATEEOF
 
-            reconcile_peer_state "$peer_pubkey" "$endpoint" "$latest_hs" "$hs_age" "$keepalive"
+            cache_upsert_peer_runtime "$peer_id" "$peer_pubkey" "$endpoint" "$latest_hs" "$now_epoch" "$peer_state" "$clear_activation" || true
 
             if [ "$latest_hs" -gt 0 ] && [ "$hs_age" -lt "$ENDPOINT_TIMEOUT" ]; then
                 publish_observation_for_peer "$peer_pubkey" "$peer_id" "$endpoint" "$latest_hs" "$now_epoch"
@@ -1430,18 +1624,18 @@ peer_sync_loop() {
             publish_observation_for_peer "$LOCAL_PUBLIC_KEY" "$LOCAL_PEER_ID" "$EXPLICIT_ENDPOINT" "0" "$now_epoch"
         fi
 
-        enforce_config_allowlist
+        enforce_config_allowlist "$wg_dump"
 
-        auto_activate_configured_peers
+        auto_activate_configured_peers "$wg_dump"
 
-        if [ -n "$DETECTOR_PEER_IDS" ]; then
-            split_detector_peer_ids "$DETECTOR_PEER_IDS" | while IFS= read -r detector_peer_id; do
+        if [ -n "$DETECTOR_PEERS_LIST" ]; then
+            split_detector_peer_ids | while IFS= read -r detector_peer_id; do
                 #log debug "checking detector peer_id=$detector_peer_id"
                 detector_pubkey="$(cache_get_str "$detector_peer_id" "public_key")"
                 if [ -n "$detector_pubkey" ]; then
                     detector_state="$(cache_get_str "$detector_peer_id" "state")"
 
-                    if [ -z "$detector_state" ] || [ "$detector_state" = "INACTIVE" ]  || ! wg show "$WG_INTERFACE" peers | grep -Fxq "$detector_pubkey"; then
+                    if [ -z "$detector_state" ] || [ "$detector_state" = "INACTIVE" ]  || ! wg_dump_has_peer_pubkey "$wg_dump" "$detector_pubkey"; then
                         log debug "detector check: peer_id=$detector_peer_id state=$detector_state, activating for endpoint detection"
                         activate_peer "$detector_peer_id" "$detector_pubkey" "endpoint-detection" || true
                     elif [ "$detector_state" = "CONNECTED" ] || [ "$detector_state" = "ACTIVATING" ]; then
@@ -1474,6 +1668,7 @@ cleanup() {
         kill "$PID_SYNC" 2>/dev/null || true
     fi
 
+    rm -f "$BINDING_CACHE_FILE" 2>/dev/null || true
     cache_unlock
 }
 
@@ -1506,6 +1701,7 @@ main() {
     [ -n "$LOCAL_PEER_ID" ] || die "failed to calculate local peer_id"
 
     cache_init
+    BINDING_CACHE_FILE="/tmp/wpcp-${WG_INTERFACE}-bindings"
     ensure_local_peer_record
 
     if [ -n "$CONFIG_FILE" ]; then
