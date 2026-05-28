@@ -332,6 +332,7 @@ setup_dependencies() {
     require_cmd mosquitto_sub
     require_cmd sha256sum
     require_cmd base32
+    require_cmd stat
 
     if ! command -v openssl >/dev/null 2>&1 && ! command -v xxd >/dev/null 2>&1; then
         die "need either openssl or xxd for peer_id hash->base32 conversion"
@@ -576,7 +577,7 @@ enforce_config_allowlist() {
         fi
 
         if ! config_has_peer "$peer_id" || config_peer_is_disabled "$peer_id"; then
-            log warn "config enforcement: removing peer_id=$peer_id not present or disabled in $CONFIG_FILE"
+            log info "config enforcement: removing peer_id=$peer_id not present or disabled in $CONFIG_FILE"
             if ! deactivate_peer "$peer_id" "$peer_pubkey" "config-request"; then
                 log warn "config enforcement: failed removing peer_id=$peer_id"
             fi
@@ -666,6 +667,73 @@ $detector_peer_id"
 split_detector_peer_ids() {
     [ -n "$DETECTOR_PEERS_LIST" ] || return 0
     printf '%s\n' "$DETECTOR_PEERS_LIST"
+}
+
+# Function: build_observation_topics
+# Purpose: Build explicit observation topics from config peers and detector peers.
+# Inputs: Uses CONFIG_DATA/CONFIG_READY, detector cache, and TOPIC_PREFIX.
+# Outputs: Prints one observation topic per line.
+build_observation_topics() {
+    local peer_set="
+"
+    local obs_topics=""
+    local peer_id=""
+    local config_peer_ids=""
+    local detector_peer_ids=""
+
+    if [ -n "$LOCAL_PEER_ID" ]; then
+        peer_set="${peer_set}${LOCAL_PEER_ID}
+"
+        obs_topics="$TOPIC_PREFIX/peer/$LOCAL_PEER_ID/observation"
+    fi
+
+    if [ "$CONFIG_READY" = "1" ]; then
+        config_peer_ids="$(config_get_peers 2>/dev/null || true)"
+        while IFS= read -r peer_id; do
+            [ -n "$peer_id" ] || continue
+
+            case "$peer_set" in
+                *"
+$peer_id
+"*) continue ;;
+            esac
+
+            peer_set="${peer_set}${peer_id}
+"
+            if [ -n "$obs_topics" ]; then
+                obs_topics="${obs_topics}
+$TOPIC_PREFIX/peer/$peer_id/observation"
+            else
+                obs_topics="$TOPIC_PREFIX/peer/$peer_id/observation"
+            fi
+        done <<EOF
+$config_peer_ids
+EOF
+    fi
+
+    detector_peer_ids="$(split_detector_peer_ids 2>/dev/null || true)"
+    while IFS= read -r peer_id; do
+        [ -n "$peer_id" ] || continue
+
+        case "$peer_set" in
+            *"
+$peer_id
+"*) continue ;;
+        esac
+
+        peer_set="${peer_set}${peer_id}
+"
+        if [ -n "$obs_topics" ]; then
+            obs_topics="${obs_topics}
+$TOPIC_PREFIX/peer/$peer_id/observation"
+        else
+            obs_topics="$TOPIC_PREFIX/peer/$peer_id/observation"
+        fi
+    done <<EOF
+$detector_peer_ids
+EOF
+
+    printf '%s\n' "$obs_topics"
 }
 
 # Function: is_detector_peer_id
@@ -980,10 +1048,6 @@ auto_activate_configured_peers() {
 
         if config_peer_is_disabled "$peer_id"; then
             log debug "auto management: skip disabled peer_id=$peer_id"
-            if wg_dump_has_peer_pubkey "$wg_dump" "$peer_pubkey"; then
-                log info "auto management: deactivating disabled peer_id=$peer_id"
-                deactivate_peer "$peer_id" "$peer_pubkey" "config-disabled" || true
-            fi
             continue
         fi
 
@@ -1041,13 +1105,21 @@ mqtt_pub() {
 
 # Function: mqtt_subscribe_stream
 # Purpose: Open MQTT subscription stream for control and observation topics.
-# Inputs: $1 = control topic, $2 = observation topic wildcard.
+# Inputs: $1 = control topic, $2 = newline-separated observation topics.
 # Outputs: Streams mosquitto_sub lines to stdout.
 mqtt_subscribe_stream() {
     local control_topic="$1"
-    local obs_topic="$2"
+    local obs_topics="${2:-}"
+    local obs_topic=""
 
-    set -- mosquitto_sub -h "$MQTT_BROKER" -p "$MQTT_PORT" -v -q 1 -t "$control_topic" -t "$obs_topic"
+    set -- mosquitto_sub -h "$MQTT_BROKER" -p "$MQTT_PORT" -v -q 1 -t "$control_topic"
+    while IFS= read -r obs_topic; do
+        [ -n "$obs_topic" ] || continue
+        set -- "$@" -t "$obs_topic"
+    done <<EOF
+$obs_topics
+EOF
+
     if [ -n "$MQTT_USERNAME" ]; then
         set -- "$@" -u "$MQTT_USERNAME"
     fi
@@ -1472,12 +1544,20 @@ handle_control_message() {
 # Outputs: Long-running loop; retries on subscription disconnect.
 control_and_observation_subscriber_loop() {
     local control_topic="$TOPIC_PREFIX/peer/$LOCAL_PEER_ID/control"
-    local obs_topic="$TOPIC_PREFIX/peer/+/observation"
-
-    log info "subscribing topics: $control_topic, $obs_topic"
 
     while true; do
-        mqtt_subscribe_stream "$control_topic" "$obs_topic" | while IFS= read -r line; do
+        local obs_topics=""
+        local obs_count="0"
+
+        obs_topics="$(build_observation_topics)"
+        if [ -n "$obs_topics" ]; then
+            obs_count="$(printf '%s\n' "$obs_topics" | sed '/^$/d' | wc -l | tr -d ' ')"
+            log info "subscribing topics: $control_topic + $obs_count observation topics"
+        else
+            log warn "subscribing topics: $control_topic (no observation topics from config/detector)"
+        fi
+
+        mqtt_subscribe_stream "$control_topic" "$obs_topics" | while IFS= read -r line; do
             local topic="${line%% *}"
             local payload="${line#* }"
 
@@ -1564,10 +1644,19 @@ reconcile_peer_state() {
 # Inputs: Uses STATE_INTERVAL and WG interface dump output.
 # Outputs: Long-running loop that updates cache, reconciles state, and publishes observation.
 peer_sync_loop() {
+    local last_config_mtime="$CONFIG_MTIME"
+
     while true; do
         if [ -n "$CONFIG_FILE" ]; then
             if config_reload; then
                 log debug "reloaded config file: $CONFIG_FILE"
+                if [ -n "$last_config_mtime" ] && [ "$CONFIG_MTIME" != "$last_config_mtime" ]; then
+                    log info "config mtime changed ($last_config_mtime -> $CONFIG_MTIME), restarting subscriber"
+                    if [ -n "$PID_CONTROL" ] && kill -0 "$PID_CONTROL" 2>/dev/null; then
+                        kill "$PID_CONTROL" 2>/dev/null || true
+                    fi
+                fi
+                last_config_mtime="$CONFIG_MTIME"
             elif [ "$CONFIG_READY" != "1" ]; then
                 log warn "config not ready yet: $CONFIG_FILE; policy checks skipped for this cycle"
             else
@@ -1728,8 +1817,17 @@ main() {
     log info "$APP_NAME started iface=$WG_INTERFACE local_peer_id=$LOCAL_PEER_ID cache=$CACHE_FILE"
 
     while [ "$RUNNING" = "1" ]; do
-        kill -0 "$PID_CONTROL" 2>/dev/null || break
-        kill -0 "$PID_SYNC" 2>/dev/null || break
+        if ! kill -0 "$PID_SYNC" 2>/dev/null; then
+            log error "peer sync loop exited unexpectedly"
+            break
+        fi
+
+        if ! kill -0 "$PID_CONTROL" 2>/dev/null; then
+            log warn "control subscriber loop exited, restarting"
+            control_and_observation_subscriber_loop &
+            PID_CONTROL="$!"
+        fi
+
         sleep 1
     done
 

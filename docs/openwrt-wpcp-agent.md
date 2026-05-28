@@ -34,7 +34,7 @@ Install packages (names may vary by feed/build):
 
 ```sh
 opkg update
-opkg install wireguard-tools mosquitto-client jq coreutils-base32
+opkg install wireguard-tools mosquitto-client jq coreutils-base32 coreutils-stat
 # Optional helper for peer_id conversion fallback:
 opkg install openssl-util
 ```
