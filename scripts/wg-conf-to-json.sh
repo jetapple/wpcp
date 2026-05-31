@@ -2,8 +2,10 @@
 
 # wg-conf-to-json.sh
 # Reads WireGuard configuration from the current system and outputs
-# structured JSON to stdout by default. If -o/--output is provided,
-# JSON is written to the specified file.
+# structured JSON. If -o/--output is provided, JSON is written
+# as per-interface files in the specified directory.
+# If -o/--output is omitted, per-interface JSON objects are printed
+# to stdout, one object per line.
 #
 # Supported platforms:
 #   - Linux:   /etc/wireguard/*.conf
@@ -14,7 +16,8 @@
 #     "<ifname>": {
 #       "<peer_id>": {
 #         "public_key": "...",
-#         "allowed_ips": ["..."],
+#         "allowed_ips": ["..."],     # omitted if absent
+#         "assigned_ips": ["..."],    # omitted if absent
 #         "endpoint": "...",          # omitted if absent
 #         "persistent_keepalive": N,  # omitted if absent
 #         "disabled": "0|1"          # omitted if absent
@@ -26,19 +29,24 @@
 
 set -u
 
-OUTPUT_FILE=""
+OUTPUT_DIR=""
 
 usage() {
     cat <<EOF
 Usage: wg-conf-to-json.sh [options]
 
 Options:
-  -o, --output PATH   Output JSON path (if omitted, print JSON to stdout)
+  -o, --output DIR    Output JSON directory (wpcp-<ifname>-conf.json per interface)
   -h, --help          Show this help and exit
 
 This script auto-detects platform and reads WireGuard peer config from:
   - Linux:   /etc/wireguard/*.conf
   - OpenWRT: UCI network config
+
+Output behavior:
+  - With -o/--output DIR: write one file per interface:
+      DIR/wpcp-<ifname>-conf.json
+  - Without -o/--output: print one interface JSON object per line to stdout
 EOF
 }
 
@@ -46,7 +54,12 @@ parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -o|--output)
-                OUTPUT_FILE="$2"
+                if [ "$#" -lt 2 ]; then
+                    printf 'error: missing argument for %s\n' "$1" >&2
+                    usage >&2
+                    exit 1
+                fi
+                OUTPUT_DIR="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -108,9 +121,10 @@ parse_linux_conf() {
         }
         function flush_peer() {
             if (pubkey == "") return
-            print "P" COLSEP pubkey COLSEP allowed_ips COLSEP endpoint COLSEP keepalive COLSEP description
+            print "P" COLSEP pubkey COLSEP allowed_ips COLSEP assigned_ips COLSEP endpoint COLSEP keepalive COLSEP description
             pubkey = ""
             allowed_ips = ""
+            assigned_ips = ""
             endpoint = ""
             keepalive = ""
             description = ""
@@ -150,6 +164,12 @@ parse_linux_conf() {
                 } else {
                     allowed_ips = allowed_ips FSSEP val
                 }
+            } else if (key == "AssignedIPs") {
+                if (assigned_ips == "") {
+                    assigned_ips = val
+                } else {
+                    assigned_ips = assigned_ips FSSEP val
+                }
             } else if (key == "Endpoint") {
                 endpoint = val
             } else if (key == "PersistentKeepalive") {
@@ -161,7 +181,7 @@ parse_linux_conf() {
         END {
             flush_peer()
         }
-    ' "$conf" | while IFS="$col_sep" read -r rec_type pubkey allowed_raw endpoint keepalive description; do
+    ' "$conf" | while IFS="$col_sep" read -r rec_type pubkey allowed_raw assigned_raw endpoint keepalive description; do
         [ "$rec_type" = "P" ] || continue
         [ -z "$pubkey" ] && continue
 
@@ -173,6 +193,7 @@ parse_linux_conf() {
             --arg pid "$peer_id" \
             --arg pk "$pubkey" \
             --arg ips_raw "$allowed_raw" \
+            --arg assigned_raw "$assigned_raw" \
             --arg sep "$field_sep" \
             --arg ep "$endpoint" \
             --arg ka "$keepalive" \
@@ -181,7 +202,9 @@ parse_linux_conf() {
                 ifname:$ifname,
                 peer_id:$pid,
                 obj:(
-                    {public_key:$pk, allowed_ips:(if $ips_raw == "" then [] else ($ips_raw | split($sep) | map(gsub("^\\s+|\\s+$"; "") | select(length > 0))) end)}
+                    ({public_key:$pk}
+                    + (if $ips_raw != "" then {allowed_ips:($ips_raw | split($sep) | map(gsub("^\\s+|\\s+$"; "") | select(length > 0)))} else {} end))
+                    + (if $assigned_raw != "" then {assigned_ips:($assigned_raw | split($sep) | map(gsub("^\\s+|\\s+$"; "") | select(length > 0)))} else {} end)
                     + (if $ep != "" then {endpoint:$ep} else {} end)
                     + (if $ka != "" then {persistent_keepalive:($ka|tonumber)} else {} end)
                     + (if $desc != "" then {description:$desc} else {} end)
@@ -242,7 +265,7 @@ collect_openwrt() {
                 sec = substr(rest, 1, dot - 1)
                 opt = substr(rest, dot + 1)
                 k = sec SUBSEP opt
-                if (opt == "allowed_ips") {
+                if (opt == "allowed_ips" || opt == "assigned_ips") {
                     if (k in section_opt && section_opt[k] != "") {
                         section_opt[k] = section_opt[k] FSSEP val
                     } else {
@@ -287,10 +310,11 @@ collect_openwrt() {
                       section_opt[sec SUBSEP "endpoint_port"] COLSEP \
                       section_opt[sec SUBSEP "persistent_keepalive"] COLSEP \
                       section_opt[sec SUBSEP "description"] COLSEP \
-                      section_opt[sec SUBSEP "allowed_ips"]
+                      section_opt[sec SUBSEP "allowed_ips"] COLSEP \
+                      section_opt[sec SUBSEP "assigned_ips"]
             }
         }
-    ' | while IFS="$col_sep" read -r rec_type ifname pubkey disabled_val ep_host ep_port keepalive description allowed_raw; do
+    ' | while IFS="$col_sep" read -r rec_type ifname pubkey disabled_val ep_host ep_port keepalive description allowed_raw assigned_raw; do
         case "$rec_type" in
             I)
                 printf '%s\n' "$(jq -cn --arg ifname "$ifname" '{ifname:$ifname}')"
@@ -314,6 +338,7 @@ collect_openwrt() {
                     --arg pid "$peer_id" \
                     --arg pk "$pubkey" \
                     --arg ips_raw "$allowed_raw" \
+                    --arg assigned_raw "$assigned_raw" \
                     --arg sep "$field_sep" \
                     --arg ep "$endpoint" \
                     --arg ka "$keepalive" \
@@ -323,7 +348,9 @@ collect_openwrt() {
                         ifname:$ifname,
                         peer_id:$pid,
                         obj:(
-                            {public_key:$pk, allowed_ips:(if $ips_raw == "" then [] else ($ips_raw | split($sep) | map(select(length > 0))) end)}
+                            ({public_key:$pk}
+                            + (if $ips_raw != "" then {allowed_ips:($ips_raw | split($sep) | map(select(length > 0)))} else {} end))
+                            + (if $assigned_raw != "" then {assigned_ips:($assigned_raw | split($sep) | map(select(length > 0)))} else {} end)
                             + (if $ep != "" then {endpoint:$ep} else {} end)
                             + (if $ka != "" then {persistent_keepalive:($ka|tonumber)} else {} end)
                             + (if $desc != "" then {description:$desc} else {} end)
@@ -384,13 +411,50 @@ main() {
         )
     ' "$tmp_lines")"
 
-    if [ -n "$OUTPUT_FILE" ]; then
-        tmp_out="$(mktemp)"
-        printf '%s\n' "$result" > "$tmp_out"
-        mv "$tmp_out" "$OUTPUT_FILE"
-        printf 'written: %s\n' "$OUTPUT_FILE"
+    if [ -n "$OUTPUT_DIR" ]; then
+        if [ ! -d "$OUTPUT_DIR" ]; then
+            printf 'error: output directory does not exist: %s\n' "$OUTPUT_DIR" >&2
+            exit 1
+        fi
+
+        write_failed=0
+        tmp_ifnames="$(mktemp)"
+        if ! printf '%s\n' "$result" | jq -r 'keys[]' > "$tmp_ifnames"; then
+            printf 'error: failed to enumerate interfaces from JSON result\n' >&2
+            rm -f "$tmp_ifnames"
+            exit 1
+        fi
+
+        while IFS= read -r ifname; do
+            [ -z "$ifname" ] && continue
+
+            out_file="$OUTPUT_DIR/wpcp-${ifname}-conf.json"
+            tmp_out="$(mktemp)"
+
+            if ! printf '%s\n' "$result" | jq --arg ifname "$ifname" '{($ifname): .[$ifname]}' > "$tmp_out"; then
+                printf 'error: failed to build JSON for interface: %s\n' "$ifname" >&2
+                rm -f "$tmp_out"
+                write_failed=1
+                continue
+            fi
+
+            if ! mv "$tmp_out" "$out_file"; then
+                printf 'error: failed to write output file: %s\n' "$out_file" >&2
+                rm -f "$tmp_out"
+                write_failed=1
+                continue
+            fi
+
+            printf 'written: %s\n' "$out_file"
+        done < "$tmp_ifnames"
+
+        rm -f "$tmp_ifnames"
+
+        if [ "$write_failed" -ne 0 ]; then
+            exit 1
+        fi
     else
-        printf '%s\n' "$result"
+        printf '%s\n' "$result" | jq -c 'to_entries[] | {(.key): .value}'
     fi
 }
 
