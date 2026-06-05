@@ -50,7 +50,7 @@ start_instance() {
     config_get endpoint "$section" endpoint ""
     config_get detector "$section" detector ""
     detector="${detector// /,}"
-    config_get state_interval "$section" state_interval "10"
+    config_get state_interval "$section" state_interval "20"
     config_get endpoint_timeout "$section" endpoint_timeout "180"
     config_get failed_timeout "$section" failed_timeout "30"
     config_get keepalive_active "$section" keepalive_active "25"
@@ -109,14 +109,7 @@ service_triggers() {
 }
 
 stop_service() {
-    local stale
-
-    # Defensive cleanup: kill leftover shells running the agent script.
-    stale="$(pidof wpcp-agent.sh 2>/dev/null || true)"
-    if [ -n "$stale" ]; then
-        kill $stale 2>/dev/null || true
-        sleep 1
-        stale="$(pidof wpcp-agent.sh 2>/dev/null || true)"
-        [ -n "$stale" ] && kill -9 $stale 2>/dev/null || true
-    fi
+    # procd stops each instance main process; child cleanup is handled by the
+    # agent's TERM trap in scripts/wpcp-agent.sh.
+    return 0
 }

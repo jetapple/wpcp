@@ -114,6 +114,8 @@ Store results as:
 The WPCP agent of peer A and B use `wpcp-conf.json` to know each other's peer id and public key.
 You can also use `scripts/wg-conf-to-json.sh` script to generate `wpcp-conf.json` from WireGuard config file: /etc/wireguard/*.conf
 
+Config schema note: peer entries are under `<ifname>.peers.<peer_id>`.
+
 ### 4.1 Peer A config
 
 Create `/etc/wpcp-conf.json` on Peer A:
@@ -121,10 +123,12 @@ Create `/etc/wpcp-conf.json` on Peer A:
 ```json
 {
 	"wg0": {
-		"B_PEER_ID": {
-			"public_key": "B_PUBKEY",
-			"allowed_ips": ["10.10.0.2/32"],
-			"description": "Peer B behind NAT"
+		"peers": {
+			"B_PEER_ID": {
+				"public_key": "B_PUBKEY",
+				"allowed_ips": ["10.10.0.2/32"],
+				"description": "Peer B behind NAT"
+			}
 		}
 	}
 }
@@ -139,10 +143,12 @@ Create `/etc/wpcp-conf.json` on Peer B:
 ```json
 {
 	"wg0": {
-		"A_PEER_ID": {
-			"public_key": "A_PUBKEY",
-			"allowed_ips": ["10.10.0.1/32"],
-			"description": "Peer A behind NAT"
+		"peers": {
+			"A_PEER_ID": {
+				"public_key": "A_PUBKEY",
+				"allowed_ips": ["10.10.0.1/32"],
+				"description": "Peer A behind NAT"
+			}
 		}
 	}
 }

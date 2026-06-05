@@ -18,7 +18,7 @@ MQTT_CAFILE=""
 MQTT_CERT=""
 MQTT_KEY=""
 TOPIC_PREFIX="wg"
-STATE_INTERVAL="15"
+STATE_INTERVAL="20"
 ENDPOINT_TIMEOUT="180"
 FAILED_TIMEOUT="30"
 KEEPALIVE_ACTIVE="25"
@@ -43,6 +43,7 @@ LOCAL_PEER_ID=""
 
 PID_CONTROL=""
 PID_SYNC=""
+CONTROL_PID_FILE=""
 RUNNING="1"
 
 # Function: usage
@@ -208,6 +209,7 @@ validate_args() {
         CACHE_FILE="/tmp/wpcp-${WG_INTERFACE}-cache.json"
     fi
     CACHE_LOCK_DIR="${CACHE_FILE}.lock"
+    CONTROL_PID_FILE="/tmp/wpcp-${WG_INTERFACE}-control.pid"
 }
 
 # Function: parse_args
@@ -479,7 +481,7 @@ config_enforced() {
 # Outputs: Returns 0 if present in config.
 config_has_peer() {
     local pid="$1"
-    printf '%s' "$CONFIG_DATA" | jq -e --arg iface "$WG_INTERFACE" --arg pid "$pid" '.[$iface][$pid] != null' >/dev/null 2>&1
+    printf '%s' "$CONFIG_DATA" | jq -e --arg iface "$WG_INTERFACE" --arg pid "$pid" '.[$iface].peers[$pid] != null' >/dev/null 2>&1
 }
 
 # Function: config_get_peer_public_key
@@ -488,7 +490,7 @@ config_has_peer() {
 # Outputs: Echoes configured public_key or empty string.
 config_get_peer_public_key() {
     local pid="$1"
-    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '.[$iface][$pid].public_key // ""' 2>/dev/null
+    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '.[$iface].peers[$pid].public_key // ""' 2>/dev/null
 }
 
 # Function: config_get_peer_allowed_ips
@@ -498,7 +500,7 @@ config_get_peer_public_key() {
 config_get_peer_allowed_ips() {
     local pid="$1"
     printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '
-        .[$iface][$pid].allowed_ips // empty
+                .[$iface].peers[$pid].allowed_ips // empty
         | if type == "array" then
             map(select(type == "string" and length > 0)) | join(",")
           elif type == "string" then
@@ -516,7 +518,7 @@ config_get_peer_allowed_ips() {
 config_get_peer_assigned_ips() {
         local pid="$1"
         printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '
-                .[$iface][$pid].assigned_ips // []
+        .[$iface].peers[$pid].assigned_ips // []
                 | if type == "array" then
                         map(select(type == "string" and length > 0)) | join(",")
                     else
@@ -532,7 +534,7 @@ config_get_peer_assigned_ips() {
 config_get_peer_disabled() {
     local pid="$1"
     printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" --arg pid "$pid" '
-        .[$iface][$pid].disabled // 0
+        .[$iface].peers[$pid].disabled // 0
     ' 2>/dev/null
 }
 
@@ -551,7 +553,20 @@ config_peer_is_disabled() {
 # Inputs: None.
 # Outputs: Prints one peer_id per line.
 config_get_peers() {
-    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" '(.[$iface] // {}) | keys[]' 2>/dev/null | sort
+    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" '(.[$iface].peers // {}) | keys[]' 2>/dev/null | sort
+}
+
+# Function: config_get_enabled_peers
+# Purpose: Enumerate peer IDs with disabled != 1 in current interface config.
+# Inputs: None.
+# Outputs: Prints one enabled peer_id per line.
+config_get_enabled_peers() {
+    printf '%s' "$CONFIG_DATA" | jq -r --arg iface "$WG_INTERFACE" '
+        (.[$iface].peers // {})
+        | to_entries[]
+        | select(((.value.disabled // 0) | tostring) != "1")
+        | .key
+    ' 2>/dev/null | sort
 }
 
 # Function: enforce_config_allowlist
@@ -688,7 +703,7 @@ build_observation_topics() {
     fi
 
     if [ "$CONFIG_READY" = "1" ]; then
-        config_peer_ids="$(config_get_peers 2>/dev/null || true)"
+        config_peer_ids="$(config_get_enabled_peers 2>/dev/null || true)"
         while IFS= read -r peer_id; do
             [ -n "$peer_id" ] || continue
 
@@ -1544,10 +1559,32 @@ handle_control_message() {
 # Outputs: Long-running loop; retries on subscription disconnect.
 control_and_observation_subscriber_loop() {
     local control_topic="$TOPIC_PREFIX/peer/$LOCAL_PEER_ID/control"
+    local fifo_path=""
+    local mqtt_pid=""
+
+    trap '
+        if [ -n "$mqtt_pid" ]; then
+            kill "$mqtt_pid" 2>/dev/null || true
+        fi
+        if [ -n "$fifo_path" ]; then
+            rm -f "$fifo_path" 2>/dev/null || true
+        fi
+        exit 0
+    ' INT TERM
 
     while true; do
         local obs_topics=""
         local obs_count="0"
+
+        if [ -n "$CONFIG_FILE" ]; then
+            if config_reload; then
+                log debug "reloaded config file (subscriber path): $CONFIG_FILE"
+            elif [ "$CONFIG_READY" != "1" ]; then
+                log warn "subscriber path: config not ready yet: $CONFIG_FILE; using current topic snapshot"
+            else
+                log warn "subscriber path: using last valid config snapshot from $CONFIG_FILE"
+            fi
+        fi
 
         obs_topics="$(build_observation_topics)"
         if [ -n "$obs_topics" ]; then
@@ -1557,7 +1594,18 @@ control_and_observation_subscriber_loop() {
             log warn "subscribing topics: $control_topic (no observation topics from config/detector)"
         fi
 
-        mqtt_subscribe_stream "$control_topic" "$obs_topics" | while IFS= read -r line; do
+        fifo_path="/tmp/wpcp-${WG_INTERFACE}-control-sub.$$"
+        rm -f "$fifo_path" 2>/dev/null || true
+        if ! mkfifo "$fifo_path"; then
+            log warn "failed to create fifo: $fifo_path"
+            sleep 3
+            continue
+        fi
+
+        mqtt_subscribe_stream "$control_topic" "$obs_topics" > "$fifo_path" &
+        mqtt_pid="$!"
+
+        while IFS= read -r line; do
             local topic="${line%% *}"
             local payload="${line#* }"
 
@@ -1566,7 +1614,12 @@ control_and_observation_subscriber_loop() {
             else
                 handle_observation_message "$payload"
             fi
-        done
+        done < "$fifo_path"
+
+        wait "$mqtt_pid" 2>/dev/null || true
+        mqtt_pid=""
+        rm -f "$fifo_path" 2>/dev/null || true
+        fifo_path=""
 
         log warn "mosquitto_sub exited, retrying in 3s"
         sleep 3
@@ -1651,9 +1704,12 @@ peer_sync_loop() {
             if config_reload; then
                 log debug "reloaded config file: $CONFIG_FILE"
                 if [ -n "$last_config_mtime" ] && [ "$CONFIG_MTIME" != "$last_config_mtime" ]; then
+                    refresh_detector_peer_cache
                     log info "config mtime changed ($last_config_mtime -> $CONFIG_MTIME), restarting subscriber"
-                    if [ -n "$PID_CONTROL" ] && kill -0 "$PID_CONTROL" 2>/dev/null; then
-                        kill "$PID_CONTROL" 2>/dev/null || true
+                    local _current_control_pid=""
+                    _current_control_pid="$(cat "$CONTROL_PID_FILE" 2>/dev/null || true)"
+                    if [ -n "$_current_control_pid" ] && kill -0 "$_current_control_pid" 2>/dev/null; then
+                        kill "$_current_control_pid" 2>/dev/null || true
                     fi
                 fi
                 last_config_mtime="$CONFIG_MTIME"
@@ -1704,7 +1760,7 @@ STATEEOF
 
             cache_upsert_peer_runtime "$peer_id" "$peer_pubkey" "$endpoint" "$latest_hs" "$now_epoch" "$peer_state" "$clear_activation" || true
 
-            if [ "$latest_hs" -gt 0 ] && [ "$hs_age" -lt "$ENDPOINT_TIMEOUT" ]; then
+            if [ "$latest_hs" -gt 0 ] && [ "$hs_age" -lt "$ENDPOINT_TIMEOUT" ] && ! is_detector_peer_id "$peer_id"; then
                 publish_observation_for_peer "$peer_pubkey" "$peer_id" "$endpoint" "$latest_hs" "$now_epoch"
             fi
         done
@@ -1758,6 +1814,7 @@ cleanup() {
     fi
 
     rm -f "$BINDING_CACHE_FILE" 2>/dev/null || true
+    rm -f "$CONTROL_PID_FILE" 2>/dev/null || true
     cache_unlock
 }
 
@@ -1810,6 +1867,7 @@ main() {
 
     control_and_observation_subscriber_loop &
     PID_CONTROL="$!"
+    printf '%s\n' "$PID_CONTROL" > "$CONTROL_PID_FILE"
 
     peer_sync_loop &
     PID_SYNC="$!"
@@ -1826,9 +1884,10 @@ main() {
             log warn "control subscriber loop exited, restarting"
             control_and_observation_subscriber_loop &
             PID_CONTROL="$!"
+            printf '%s\n' "$PID_CONTROL" > "$CONTROL_PID_FILE"
         fi
 
-        sleep 1
+        sleep 5
     done
 
     cleanup

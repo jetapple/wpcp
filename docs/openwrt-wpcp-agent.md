@@ -162,7 +162,7 @@ config instance 'main'
 The file referenced by `option config` (for example, `/etc/wpcp-conf.json`) is a per-interface peer policy map.
 
 - Top-level keys are WireGuard interface names (for example, `wg0`, `wg1`)
-- Each interface value is an object keyed by WPCP `peer_id`
+- Each interface value contains a `peers` object keyed by WPCP `peer_id`
 - Each peer object supports:
   - `public_key` (required): peer WireGuard public key
   - `allowed_ips` (optional): list of allowed IP CIDRs
@@ -174,18 +174,19 @@ Example `/etc/wpcp-conf.json`:
 
 ```json
 {
-  "wg0": {},
   "wg1": {
-    "ugiujuhy6kon5zugsbpau3wuj4": {
-      "public_key": "HK+hq8Fkk1gbD07sYz/QpG8zMETCUu+3snLS6/EiVX8=",
-      "allowed_ips": [
-        "0.0.0.0/0"
-      ],
-      "description": "Homeport_Liu",
-      "assigned_ips": [
-        "10.13.23.10/24"
-      ],
-      "disabled": "0"
+    "peers": {
+      "ugiujuhy6kon5zugsbpau3wuj4": {
+        "public_key": "HK+hq8Fkk1gbD07sYz/QpG8zMETCUu+3snLS6/EiVX8=",
+        "allowed_ips": [
+          "0.0.0.0/0"
+        ],
+        "description": "Homeport",
+        "assigned_ips": [
+          "10.13.23.10/24"
+        ],
+        "disabled": "0"
+      }
     }
   }
 }
