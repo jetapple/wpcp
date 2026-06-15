@@ -102,6 +102,29 @@ config instance 'main'
 /etc/init.d/wpcp-agent start
 ```
 
+## LuCI App (OpenWrt >23.x stack)
+
+An initial LuCI package is available under `luci-app-wpcp/` in this repository.
+
+Implementation choices:
+
+- Uses modern LuCI entrypoint via `menu.d` JSON
+- Uses JavaScript view (`view/wpcp/overview.js`)
+- Uses rpcd ACL policy (`rpcd/acl.d/luci-app-wpcp.json`)
+- Does not use legacy Lua controller + CBI
+
+Current page capabilities:
+
+- Lists all `wpcp-agent` UCI instances
+- Runs service actions (`start`, `stop`, `restart`, `reload`)
+- Reads per-instance JSON policy from `option config`
+- Lists peers under `<ifname>.peers`
+- Supports peer add/edit/delete and `disabled` toggle
+
+Behavior note:
+
+- Peer `disabled` is a config policy flag, not an immediate runtime deactivation command.
+
 ## Cache File
 
 Default cache file:

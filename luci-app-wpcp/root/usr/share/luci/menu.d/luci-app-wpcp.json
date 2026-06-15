@@ -1,0 +1,15 @@
+{
+  "admin/services/wpcp": {
+    "title": "WPCP",
+    "order": 65,
+    "action": {
+      "type": "view",
+      "path": "wpcp/overview"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-wpcp"
+      ]
+    }
+  }
+}

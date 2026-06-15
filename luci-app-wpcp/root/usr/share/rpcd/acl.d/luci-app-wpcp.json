@@ -1,0 +1,50 @@
+{
+  "luci-app-wpcp": {
+    "description": "Grant access to WPCP LuCI app",
+    "read": {
+      "uci": [
+        "wpcp-agent"
+      ],
+      "ubus": {
+        "service": [
+          "list"
+        ],
+        "file": [
+          "read",
+          "list",
+          "stat"
+        ]
+      },
+      "file": [
+        "/etc/wpcp*.json",
+        "/tmp/wpcp-*.json"
+      ]
+    },
+    "write": {
+      "uci": [
+        "wpcp-agent"
+      ],
+      "ubus": {
+        "luci": [
+          "setInitAction"
+        ],
+        "file": [
+          "write",
+          "remove",
+          "exec"
+        ]
+      },
+      "file": {
+        "/etc/wpcp*.json": [
+          "write"
+        ],
+        "/etc/init.d/wpcp-agent": [
+          "exec"
+        ],
+        "/etc/init.d/wpcp-agent *": [
+          "exec"
+        ]
+      }
+    }
+  }
+}
