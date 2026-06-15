@@ -66,7 +66,7 @@ start_instance() {
         return 0
     fi
 
-    procd_open_instance
+    procd_open_instance "$section"
     procd_set_param env WPCP_LOG_NO_TS=1
     procd_set_param command "$PROG" \
         --interface "$interface" \
@@ -99,8 +99,30 @@ start_instance() {
     procd_close_instance
 }
 
+valid_instance_section() {
+    local section="$1"
+    local stype=""
+
+    [ -n "$section" ] || return 1
+    config_get stype "$section" TYPE ""
+    [ "$stype" = "instance" ]
+}
+
 start_service() {
+    local target_instance="$1"
+
     config_load "$CONFIGNAME"
+
+    if [ -n "$target_instance" ]; then
+        if ! valid_instance_section "$target_instance"; then
+            logger -t wpcp-agent "instance=$target_instance not found, skip start"
+            return 1
+        fi
+
+        start_instance "$target_instance"
+        return $?
+    fi
+
     config_foreach start_instance instance
 }
 
@@ -108,8 +130,37 @@ service_triggers() {
     procd_add_reload_trigger "$CONFIGNAME"
 }
 
+stop_instance() {
+    local section="$1"
+
+    procd_kill "wpcp-agent" "$section"
+}
+
 stop_service() {
+    local target_instance="$1"
+
+    if [ -n "$target_instance" ]; then
+        config_load "$CONFIGNAME"
+
+        if ! valid_instance_section "$target_instance"; then
+            logger -t wpcp-agent "instance=$target_instance not found, skip stop"
+            return 1
+        fi
+
+        stop_instance "$target_instance"
+        return $?
+    fi
+
     # procd stops each instance main process; child cleanup is handled by the
     # agent's TERM trap in scripts/wpcp-agent.sh.
     return 0
+}
+
+reload_service() {
+    local target_instance="$1"
+
+    [ -n "$target_instance" ] || return 0
+
+    stop_service "$target_instance" || return $?
+    start_service "$target_instance"
 }
