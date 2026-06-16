@@ -43,6 +43,12 @@
         ],
         "/etc/init.d/wpcp-agent *": [
           "exec"
+        ],
+        "/sbin/ip": [
+          "exec"
+        ],
+        "/sbin/ip -o addr show dev *": [
+          "exec"
         ]
       }
     }

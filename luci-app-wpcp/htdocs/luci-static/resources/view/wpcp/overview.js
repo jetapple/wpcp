@@ -159,6 +159,8 @@ function calculatePeerId(publicKey) {
 
 return view.extend({
     policyState: {},
+    cacheState: {},
+    interfaceAddresses: {},
 
     load: function() {
         var self = this;
@@ -186,6 +188,8 @@ return view.extend({
 
             return Promise.all([
                 self.loadPolicies(instances),
+                self.loadCaches(instances),
+                self.loadInterfaceAddresses(instances),
                 self.loadServiceStatus()
             ]);
         });
@@ -218,10 +222,167 @@ return view.extend({
         return Promise.all(reads);
     },
 
+    loadCaches: function(instances) {
+        var self = this;
+        var reads = [];
+
+        instances.forEach(function(instance) {
+            var path = self.getCacheFile(instance);
+            if (!path || self.cacheState[path])
+                return;
+
+            reads.push(L.resolveDefault(fs.read(path), null).then(function(content) {
+                if (!content) {
+                    self.cacheState[path] = { error: null, data: null };
+                    return;
+                }
+
+                try {
+                    self.cacheState[path] = { error: null, data: JSON.parse(content) };
+                }
+                catch (e) {
+                    self.cacheState[path] = { error: null, data: null };
+                }
+            }));
+        });
+
+        return Promise.all(reads);
+    },
+
     loadServiceStatus: function() {
         return L.resolveDefault(callServiceList('wpcp-agent'), {}).then(function(res) {
             return res || {};
         });
+    },
+
+    loadInterfaceAddresses: function(instances) {
+        var self = this;
+        var reads = [];
+
+        instances.forEach(function(instance) {
+            reads.push(self.loadDeviceAddresses(instance));
+        });
+
+        return Promise.all(reads);
+    },
+
+    loadDeviceAddresses: function(instance) {
+        var self = this;
+
+        return L.resolveDefault(fs.exec('/sbin/ip', ['-o', 'addr', 'show', 'dev', instance.interface]), null)
+            .then(function(res) {
+                var addresses = [];
+
+                if (res && res.stdout) {
+                    res.stdout.split(/\n/).forEach(function(line) {
+                        var m = line.match(/^\d+:\s+\S+\s+inet6?\s+(\S+)/);
+
+                        if (m && m[1])
+                            addresses.push(m[1]);
+                    });
+                }
+
+                self.interfaceAddresses[instance.interface] = addresses;
+            });
+    },
+
+    getCacheFile: function(instance) {
+        if (instance.cache_file)
+            return instance.cache_file;
+
+        return '/tmp/wpcp-%s-cache.json'.format(instance.interface || 'wg0');
+    },
+
+    getPeerState: function(instance, peerId) {
+        var st = this.cacheState[this.getCacheFile(instance)];
+        var peer;
+
+        if (!st || !st.data || !st.data.peers)
+            return 'N/A';
+
+        peer = st.data.peers[peerId];
+        if (!peer || !peer.state)
+            return 'N/A';
+
+        return peer.state;
+    },
+
+    renderPeerState: function(instance, peerId) {
+        var state = this.getPeerState(instance, peerId);
+
+        if (state === 'CONNECTED')
+            return E('span', { 'class': 'label success' }, state);
+
+        return E('span', { 'class': 'label' }, state);
+    },
+
+    getInterfacePeerId: function(interfacePolicy) {
+        if (!interfacePolicy || !interfacePolicy.peer_id)
+            return '';
+
+        return interfacePolicy.peer_id;
+    },
+
+    getInterfaceEndpoint: function(instance, peerId, family) {
+        var st = this.cacheState[this.getCacheFile(instance)];
+        var peer;
+        var endpoint;
+
+        if (!peerId || !st || !st.data || !st.data.peers)
+            return '';
+
+        peer = st.data.peers[peerId];
+        endpoint = peer && peer.endpoint && peer.endpoint[family];
+
+        if (!endpoint || !endpoint.endpoint)
+            return '';
+
+        return endpoint.endpoint;
+    },
+
+    renderEndpointItem: function(label, endpoint) {
+        return E('span', {
+            'class': endpoint ? 'label success' : 'label',
+            'style': 'margin-right: .35em'
+        }, endpoint || label);
+    },
+
+    renderInterfaceEndpoint: function(instance, interfacePolicy) {
+        var peerId = this.getInterfacePeerId(interfacePolicy);
+        var ipv4 = this.getInterfaceEndpoint(instance, peerId, 'ipv4');
+        var ipv6 = this.getInterfaceEndpoint(instance, peerId, 'ipv6');
+
+        return E('div', {}, [
+            _('Interface endpoint: '),
+            this.renderEndpointItem('IPv4', ipv4),
+            this.renderEndpointItem('IPv6', ipv6)
+        ]);
+    },
+
+    getRuntimeInterfaceAddresses: function(instance) {
+        var addresses = [];
+
+        (this.interfaceAddresses[instance.interface] || []).forEach(function(addr) {
+            if (addresses.indexOf(addr) === -1)
+                addresses.push(addr);
+        });
+
+        return addresses.join(',');
+    },
+
+    renderInterfaceAddresses: function(instance) {
+        var addresses = this.getRuntimeInterfaceAddresses(instance);
+
+        if (!addresses)
+            return E('div', {}, [
+                _('Interface address: '),
+                E('span', { 'class': 'label' }, _('None'))
+            ]);
+
+        return E('div', {}, [
+            _('Interface address: '),
+            E('span', { 'class': 'label notice' }, addresses)
+        ]);
     },
 
     runInstanceAction: function(instance, action) {
@@ -684,7 +845,6 @@ return view.extend({
         var rows = [];
         var self = this;
         var interfacePolicy = st.data[instance.interface] || {};
-        var interfaceAddresses = toComma(interfacePolicy.address);
 
         Object.keys(peers).sort().forEach(function(peerId) {
             var p = peers[peerId] || {};
@@ -695,6 +855,10 @@ return view.extend({
                     'class': 'td',
                     'data-title': _('Peer')
                 }, p.description || ''),
+                E('td', {
+                    'class': 'td',
+                    'data-title': _('State')
+                }, self.renderPeerState(instance, peerId)),
                 E('td', {
                     'class': 'td',
                     'data-title': _('Allowed IPs')
@@ -735,7 +899,7 @@ return view.extend({
         });
 
         if (!rows.length)
-            rows.push(E('tr', {}, [E('td', { 'colspan': 5 }, _('No peers found for this interface in policy JSON.'))]));
+            rows.push(E('tr', {}, [E('td', { 'colspan': 6 }, _('No peers found for this interface in policy JSON.'))]));
 
         return E('div', {}, [
             E('style', {}, [
@@ -770,8 +934,10 @@ return view.extend({
                 'style': 'display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .5em; margin: 1em 0'
             }, [
                 E('div', {}, [
+                    E('div', {}, _('Cache file: %s').format(this.getCacheFile(instance))),
                     E('div', {}, _('Policy file: %s').format(instance.config)),
-                    E('div', {}, _('Interface Address: %s').format(interfaceAddresses))
+                    this.renderInterfaceAddresses(instance),
+                    this.renderInterfaceEndpoint(instance, interfacePolicy)
                 ]),
                 E('button', {
                     'class': 'btn cbi-button cbi-button-add',
@@ -781,6 +947,7 @@ return view.extend({
             E('table', { 'class': 'table cbi-section-table wpcp-peer-table' }, [
                 E('tr', { 'class': 'tr table-titles' }, [
                     E('th', { 'class': 'th' }, _('Peer')),
+                    E('th', { 'class': 'th' }, _('State')),
                     E('th', { 'class': 'th' }, _('Allowed IPs')),
                     E('th', { 'class': 'th' }, _('Assigned IPs')),
                     E('th', { 'class': 'th' }, _('Enabled')),
@@ -864,7 +1031,7 @@ return view.extend({
     },
 
     render: function(data) {
-        var serviceData = data[1] || {};
+        var serviceData = data[3] || {};
         var cards = [];
 
         cards.push(E('h2', {}, _('WPCP Agent')));
