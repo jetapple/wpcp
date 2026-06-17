@@ -385,6 +385,72 @@ return view.extend({
         ]);
     },
 
+    copyTextToClipboard: function(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText)
+            return navigator.clipboard.writeText(text);
+
+        return new Promise(function(resolve, reject) {
+            var textarea = document.createElement('textarea');
+            var copied = false;
+
+            textarea.value = text;
+            textarea.setAttribute('readonly', 'readonly');
+            textarea.style.position = 'fixed';
+            textarea.style.top = '-1000px';
+            document.body.appendChild(textarea);
+            textarea.select();
+
+            try {
+                copied = document.execCommand('copy');
+            }
+            catch (e) {
+                document.body.removeChild(textarea);
+                reject(e);
+                return;
+            }
+
+            document.body.removeChild(textarea);
+
+            if (copied)
+                resolve();
+            else
+                reject(new Error('copy failed'));
+        });
+    },
+
+    copyInterfacePublicKey: function(publicKey) {
+        return this.copyTextToClipboard(publicKey).then(function() {
+            var notification = ui.addNotification(null, E('p', _('Interface public key copied.')));
+
+            window.setTimeout(function() {
+                if (notification.parentNode)
+                    notification.parentNode.removeChild(notification);
+            }, 1000);
+        }).catch(function(err) {
+            ui.addNotification(null, E('p', _('Failed to copy interface public key: %s').format(err.message || err)), 'error');
+        });
+    },
+
+    renderInterfacePublicKey: function(interfacePolicy) {
+        var publicKey = interfacePolicy.public_key || '';
+
+        if (!publicKey)
+            return E('div', {}, [
+                _('Interface public key: '),
+                E('span', { 'class': 'label' }, _('None'))
+            ]);
+
+        return E('div', {}, [
+            _('Interface public key: '),
+            E('span', {
+                'class': 'label notice',
+                'style': 'cursor: pointer; user-select: all; white-space: normal; overflow-wrap: anywhere',
+                'title': _('Click to copy'),
+                'click': ui.createHandlerFn(this, 'copyInterfacePublicKey', publicKey)
+            }, publicKey)
+        ]);
+    },
+
     runInstanceAction: function(instance, action) {
         return fs.exec('/etc/init.d/wpcp-agent', [action, instance.sid]).then(function() {
             var refreshDelay = action === 'stop' ? 3000 : 1000;
@@ -936,13 +1002,10 @@ return view.extend({
                 E('div', {}, [
                     E('div', {}, _('Cache file: %s').format(this.getCacheFile(instance))),
                     E('div', {}, _('Policy file: %s').format(instance.config)),
+                    this.renderInterfacePublicKey(interfacePolicy),
                     this.renderInterfaceAddresses(instance),
                     this.renderInterfaceEndpoint(instance, interfacePolicy)
-                ]),
-                E('button', {
-                    'class': 'btn cbi-button cbi-button-add',
-                    'click': ui.createHandlerFn(this, 'addPeer', instance)
-                }, _('Add Peer'))
+                ])
             ]),
             E('table', { 'class': 'table cbi-section-table wpcp-peer-table' }, [
                 E('tr', { 'class': 'tr table-titles' }, [
@@ -954,7 +1017,15 @@ return view.extend({
                     E('th', { 'class': 'th' }, _('Actions'))
                 ])
             ].concat(rows)),
-            E('p', { 'class': 'help-text' }, _('Checked peers are enabled for auto-management. Unchecked peers are skipped at config level and are not immediately deactivated at runtime.'))
+            E('div', {
+                'style': 'display: flex; justify-content: flex-end; margin-top: .5em'
+            }, [
+                E('button', {
+                    'class': 'btn cbi-button cbi-button-add',
+                    'click': ui.createHandlerFn(this, 'addPeer', instance)
+                }, _('Add Peer'))
+            ]),
+            E('p', { 'class': 'help-text' }, _('Peer configuration changes do not take effect immediately. They are applied during the next WPCP service update cycle (10-20 seconds). Refresh the page manually to view the latest peer status.'))
         ]);
     },
 
