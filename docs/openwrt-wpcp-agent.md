@@ -232,3 +232,90 @@ config instance 'main'
 - The agent never treats MQTT as data plane; VPN payload still flows only in native WireGuard UDP.
 - On deactivation, peer config is kept and only `persistent-keepalive` is set to `0`.
 - If observation cache lacks endpoint data, activation is skipped and logged.
+
+---
+
+## Ubus / LuCI Integration
+
+### Runtime Files
+
+When running, the agent creates two additional files per interface:
+
+| File | Purpose |
+|---|---|
+| `/tmp/wpcp-<iface>-main.pid` | Main agent PID (used by rpcd plugin to detect if agent is alive) |
+| `/tmp/wpcp-<iface>-cmd.fifo` | Named pipe for local command delivery (used by rpcd plugin) |
+
+Both files are removed on clean agent shutdown.
+
+### rpcd Shell Plugin
+
+The `openwrt/rpcd/wpcp` script exposes wpcp-agent as a `wpcp` ubus object via rpcd.
+
+#### Install
+
+```sh
+cp /path/to/repo/openwrt/rpcd/wpcp /usr/libexec/rpcd/wpcp
+chmod 0755 /usr/libexec/rpcd/wpcp
+cp /path/to/repo/openwrt/rpcd-acl/wpcp.json /usr/share/rpcd/acl.d/wpcp.json
+/etc/init.d/rpcd restart
+```
+
+Additional dependency:
+
+```sh
+opkg install jq
+```
+
+#### Methods
+
+| Method | Input fields | Description |
+|---|---|---|
+| `status` | `interface` | Returns agent running state, local peer_id, public key, and peer count |
+| `peers` | `interface` | Returns the full observation cache for all known peers |
+| `activate` | `interface`, `peer_id`, `family` (optional: `ipv4`/`ipv6`/`auto`) | Queues a local activate command for the specified peer |
+| `deactivate` | `interface`, `peer_id` | Queues a local deactivate command for the specified peer |
+| `reload` | `interface` | Triggers a config file reload inside the running agent |
+| `get_config` | `interface` | Returns the current UCI configuration for the interface |
+
+#### Examples
+
+```sh
+# Check agent status
+ubus call wpcp status '{"interface":"wg0"}'
+
+# List all known peers from cache
+ubus call wpcp peers '{"interface":"wg0"}'
+
+# Activate a peer (auto endpoint family selection)
+ubus call wpcp activate '{"interface":"wg0","peer_id":"ugiujuhy6kon5zugsbpau3wuj4"}'
+
+# Activate a peer over IPv4 only
+ubus call wpcp activate '{"interface":"wg0","peer_id":"ugiujuhy6kon5zugsbpau3wuj4","family":"ipv4"}'
+
+# Deactivate a peer
+ubus call wpcp deactivate '{"interface":"wg0","peer_id":"ugiujuhy6kon5zugsbpau3wuj4"}'
+
+# Reload agent config
+ubus call wpcp reload '{"interface":"wg0"}'
+
+# Read UCI config for this interface
+ubus call wpcp get_config '{"interface":"wg0"}'
+```
+
+### Local Command Channel
+
+`activate` and `deactivate` commands sent via `ubus call wpcp` are delivered through a named pipe (`/tmp/wpcp-<iface>-cmd.fifo`) rather than through MQTT. This means:
+
+- LuCI operations work even when the MQTT broker is unreachable.
+- The agent processes the command locally and (for `activate`) still relays an MQTT notification to the remote peer via `publish_control`.
+
+### ACL Configuration
+
+`openwrt/rpcd-acl/wpcp.json` assigns:
+
+- **Read** access (`status`, `peers`, `get_config`) to the `wpcp` group.
+- **Write** access (`activate`, `deactivate`, `reload`) to the `wpcp` group.
+
+Grant these permissions in LuCI user management or extend the ACL file to map to existing roles (e.g., `luci-app-admin`).
+

@@ -1,0 +1,15 @@
+{
+  "wpcp": {
+    "description": "wpcp-agent WireGuard coordination status and control",
+    "read": {
+      "ubus": {
+        "wpcp": [ "status", "peers", "get_config" ]
+      }
+    },
+    "write": {
+      "ubus": {
+        "wpcp": [ "activate", "deactivate", "reload" ]
+      }
+    }
+  }
+}

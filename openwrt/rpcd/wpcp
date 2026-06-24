@@ -1,0 +1,294 @@
+#!/bin/sh
+
+# rpcd shell plugin for wpcp-agent.
+#
+# Install at: /usr/libexec/rpcd/wpcp
+# ACL file:   /usr/share/rpcd/acl.d/wpcp.json
+#
+# After installation, restart rpcd:
+#   /etc/init.d/rpcd restart
+#
+# Then invoke via ubus:
+#   ubus call wpcp status '{"interface":"wg0"}'
+#   ubus call wpcp peers  '{"interface":"wg0"}'
+#   ubus call wpcp activate   '{"interface":"wg0","peer_id":"<peer_id>","family":"ipv4"}'
+#   ubus call wpcp deactivate '{"interface":"wg0","peer_id":"<peer_id>"}'
+#   ubus call wpcp reload     '{"interface":"wg0"}'
+#   ubus call wpcp get_config '{"interface":"wg0"}'
+
+# Derive runtime file paths for a WireGuard interface.
+# $1 = interface name
+wpcp_cache_file()    { printf '/tmp/wpcp-%s-cache.json' "$1"; }
+wpcp_main_pid_file() { printf '/tmp/wpcp-%s-main.pid' "$1"; }
+wpcp_cmd_fifo()      { printf '/tmp/wpcp-%s-cmd.fifo' "$1"; }
+
+# Return 0 when the agent for the given interface is running.
+# $1 = interface name
+wpcp_agent_running() {
+    local iface="$1"
+    local pid_file
+    pid_file="$(wpcp_main_pid_file "$iface")"
+    [ -f "$pid_file" ] || return 1
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null)"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+# Send a JSON command line to the agent's local command FIFO.
+# Returns 1 when the FIFO is not present (agent not running).
+# $1 = interface name, $2 = JSON payload
+wpcp_send_cmd() {
+    local iface="$1"
+    local payload="$2"
+    local fifo
+    fifo="$(wpcp_cmd_fifo "$iface")"
+    [ -p "$fifo" ] || return 1
+    printf '%s\n' "$payload" > "$fifo"
+}
+
+# Produce the list of methods and their input-parameter schema for rpcd.
+list() {
+    cat <<'EOF'
+{
+  "status":     { "interface": "String" },
+  "peers":      { "interface": "String" },
+  "activate":   { "interface": "String", "peer_id": "String", "family": "String" },
+  "deactivate": { "interface": "String", "peer_id": "String" },
+  "reload":     { "interface": "String" },
+  "get_config": { "interface": "String" }
+}
+EOF
+}
+
+# Return agent running status and local peer info for a given interface.
+call_status() {
+    local iface="$1"
+
+    local running="false"
+    wpcp_agent_running "$iface" && running="true"
+
+    local cache_file
+    cache_file="$(wpcp_cache_file "$iface")"
+
+    local local_peer_id="null"
+    local local_public_key="null"
+    local peer_count="0"
+
+    if [ -f "$cache_file" ]; then
+        # Count peers from cache
+        local _count
+        _count="$(jq -r '.peers | keys | length' "$cache_file" 2>/dev/null)"
+        [ -n "$_count" ] && peer_count="$_count"
+
+        # Retrieve the local public key and matching peer_id from wg + cache
+        if command -v wg >/dev/null 2>&1; then
+            local _lpk_live
+            _lpk_live="$(wg show "$iface" public-key 2>/dev/null)"
+            if [ -n "$_lpk_live" ]; then
+                local_public_key="\"$_lpk_live\""
+                local _lp_id
+                _lp_id="$(jq -r --arg pk "$_lpk_live" '
+                    .peers | to_entries
+                    | map(select(.value.public_key == $pk))
+                    | .[0].key // ""
+                ' "$cache_file" 2>/dev/null)"
+                [ -n "$_lp_id" ] && local_peer_id="\"$_lp_id\""
+            fi
+        fi
+    fi
+
+    jq -cn \
+        --arg iface "$iface" \
+        --argjson running "$running" \
+        --argjson local_peer_id "$local_peer_id" \
+        --argjson local_public_key "$local_public_key" \
+        --argjson peer_count "$peer_count" \
+        '{
+            interface: $iface,
+            running: $running,
+            local_peer_id: $local_peer_id,
+            local_public_key: $local_public_key,
+            peer_count: $peer_count
+        }'
+}
+
+# Return all cached peer records for an interface.
+call_peers() {
+    local iface="$1"
+
+    local cache_file
+    cache_file="$(wpcp_cache_file "$iface")"
+
+    if [ ! -f "$cache_file" ]; then
+        printf '{"peers":{}}\n'
+        return 0
+    fi
+
+    jq '.' "$cache_file" 2>/dev/null || printf '{"peers":{}}\n'
+}
+
+# Trigger local peer activation via the agent command FIFO.
+call_activate() {
+    local iface="$1"
+    local input="$2"
+
+    local peer_id
+    peer_id="$(printf '%s' "$input" | jq -r '.peer_id // empty' 2>/dev/null)"
+    if [ -z "$peer_id" ]; then
+        printf '{"error":"peer_id is required"}\n'
+        return 1
+    fi
+
+    local family
+    family="$(printf '%s' "$input" | jq -r '.family // "auto"' 2>/dev/null)"
+    case "$family" in
+        ipv4|ipv6|auto) ;;
+        *) family="auto" ;;
+    esac
+
+    local payload
+    payload="$(jq -cn --arg cmd "activate" --arg pid "$peer_id" --arg fam "$family" \
+        '{cmd:$cmd,peer_id:$pid,family:$fam}')"
+
+    if wpcp_send_cmd "$iface" "$payload"; then
+        jq -cn --arg iface "$iface" --arg peer_id "$peer_id" --arg family "$family" \
+            '{result:"queued",interface:$iface,peer_id:$peer_id,family:$family}'
+    else
+        printf '{"error":"agent not running or FIFO unavailable","interface":"%s"}\n' "$iface"
+        return 1
+    fi
+}
+
+# Trigger local peer deactivation via the agent command FIFO.
+call_deactivate() {
+    local iface="$1"
+    local input="$2"
+
+    local peer_id
+    peer_id="$(printf '%s' "$input" | jq -r '.peer_id // empty' 2>/dev/null)"
+    if [ -z "$peer_id" ]; then
+        printf '{"error":"peer_id is required"}\n'
+        return 1
+    fi
+
+    local payload
+    payload="$(jq -cn --arg cmd "deactivate" --arg pid "$peer_id" \
+        '{cmd:$cmd,peer_id:$pid}')"
+
+    if wpcp_send_cmd "$iface" "$payload"; then
+        jq -cn --arg iface "$iface" --arg peer_id "$peer_id" \
+            '{result:"queued",interface:$iface,peer_id:$peer_id}'
+    else
+        printf '{"error":"agent not running or FIFO unavailable","interface":"%s"}\n' "$iface"
+        return 1
+    fi
+}
+
+# Trigger a config reload inside the running agent.
+call_reload() {
+    local iface="$1"
+
+    local payload
+    payload='{"cmd":"reload"}'
+
+    if wpcp_send_cmd "$iface" "$payload"; then
+        jq -cn --arg iface "$iface" '{result:"queued",interface:$iface}'
+    else
+        printf '{"error":"agent not running or FIFO unavailable","interface":"%s"}\n' "$iface"
+        return 1
+    fi
+}
+
+# Read and return the UCI configuration for the given interface.
+call_get_config() {
+    local iface="$1"
+
+    # Find which UCI section drives this interface
+    local section=""
+    local sec_iface=""
+    local found_section=""
+
+    if command -v uci >/dev/null 2>&1; then
+        local sections
+        sections="$(uci show wpcp-agent 2>/dev/null | grep "=instance$" | sed 's/=instance$//' | sed 's/wpcp-agent\.//')"
+        for section in $sections; do
+            sec_iface="$(uci -q get "wpcp-agent.${section}.interface" 2>/dev/null)"
+            if [ "$sec_iface" = "$iface" ]; then
+                found_section="$section"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$found_section" ]; then
+        jq -cn --arg iface "$iface" '{interface:$iface,config:null,error:"no UCI section found for interface"}'
+        return 0
+    fi
+
+    # Collect UCI options as a JSON object.
+    # uci show outputs lines like: wpcp-agent.main.broker='10.0.0.10'
+    # Strip the "wpcp-agent.<section>." prefix and the surrounding single quotes.
+    local sq="'"
+    local cfg_json
+    cfg_json="$(uci show "wpcp-agent.${found_section}" 2>/dev/null \
+        | grep -v "=instance$" \
+        | sed "s/^wpcp-agent\\.${found_section}\\.//" \
+        | awk -v sq="$sq" -F= '
+            BEGIN { printf "{" }
+            NR > 1 { printf "," }
+            {
+                key = $1
+                val = substr($0, index($0, "=") + 1)
+                gsub("^" sq "|" sq "$", "", val)
+                printf "\"" key "\":\"" val "\""
+            }
+            END { printf "}" }
+        ')"
+
+    jq -cn --arg iface "$iface" --arg section "$found_section" --argjson cfg "$cfg_json" \
+        '{interface:$iface,section:$section,config:$cfg}'
+}
+
+# Entry point — rpcd calls this script with either no args (list) or
+# "call <method> <json-input>".
+case "$1" in
+    list)
+        list
+        ;;
+    call)
+        method="$2"
+        input="${3:-{}}"
+
+        iface="$(printf '%s' "$input" | jq -r '.interface // ""' 2>/dev/null)"
+
+        case "$method" in
+            status)
+                call_status "$iface"
+                ;;
+            peers)
+                call_peers "$iface"
+                ;;
+            activate)
+                call_activate "$iface" "$input"
+                ;;
+            deactivate)
+                call_deactivate "$iface" "$input"
+                ;;
+            reload)
+                call_reload "$iface" "$input"
+                ;;
+            get_config)
+                call_get_config "$iface" "$input"
+                ;;
+            *)
+                printf '{"error":"unknown method: %s"}\n' "$method"
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        printf '{"error":"usage: wpcp list | call <method> <json>"}\n'
+        exit 1
+        ;;
+esac

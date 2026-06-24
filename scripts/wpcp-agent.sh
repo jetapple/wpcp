@@ -43,7 +43,10 @@ LOCAL_PEER_ID=""
 
 PID_CONTROL=""
 PID_SYNC=""
+PID_CMD=""
 CONTROL_PID_FILE=""
+MAIN_PID_FILE=""
+CMD_FIFO_FILE=""
 RUNNING="1"
 
 # Function: usage
@@ -1797,6 +1800,87 @@ STATEEOF
     done
 }
 
+# Function: local_cmd_loop
+# Purpose: Listen on local command FIFO for direct control requests from rpcd/LuCI.
+# Inputs: Uses CMD_FIFO_FILE global; reads JSON lines with fields cmd, peer_id, family.
+# Outputs: Long-running loop; dispatches activate/deactivate/reload commands locally.
+local_cmd_loop() {
+    local fifo_path="$CMD_FIFO_FILE"
+
+    rm -f "$fifo_path" 2>/dev/null || true
+    if ! mkfifo "$fifo_path"; then
+        log warn "local cmd loop: failed to create command FIFO: $fifo_path"
+        return 1
+    fi
+    chmod 0600 "$fifo_path"
+
+    trap '
+        rm -f "$fifo_path" 2>/dev/null || true
+        exit 0
+    ' INT TERM
+
+    log info "local cmd loop started fifo=$fifo_path"
+
+    # Open the FIFO in read-write (O_RDWR) mode on fd 4.  A pure read-only open
+    # (O_RDONLY) would block until a writer opens the other end, and each time
+    # the last writer closes the FIFO the read() would return EOF, exiting the
+    # loop.  By holding one write-end ourselves the kernel always sees at least
+    # one writer, so the blocking read waits indefinitely for the next command
+    # line without ever returning a spurious EOF.
+    exec 4<>"$fifo_path"
+
+    while IFS= read -r line <&4; do
+        [ -n "$line" ] || continue
+
+        local cmd=""
+        local peer_id=""
+        local family=""
+        cmd="$(printf '%s' "$line" | jq -r '.cmd // empty' 2>/dev/null)"
+        peer_id="$(printf '%s' "$line" | jq -r '.peer_id // empty' 2>/dev/null)"
+        family="$(printf '%s' "$line" | jq -r '.family // "auto"' 2>/dev/null)"
+
+        log debug "local cmd received cmd=$cmd peer_id=${peer_id:-} family=${family:-auto}"
+
+        case "$cmd" in
+            activate)
+                if [ -z "$peer_id" ]; then
+                    log warn "local cmd activate: missing peer_id"
+                    continue
+                fi
+                local act_pubkey=""
+                act_pubkey="$(cache_get_str "$peer_id" "public_key")"
+                if [ -z "$act_pubkey" ]; then
+                    log warn "local cmd activate: unknown peer_id=$peer_id (not in cache)"
+                    continue
+                fi
+                activate_peer "$peer_id" "$act_pubkey" "local-request" "$family" || true
+                ;;
+            deactivate)
+                if [ -z "$peer_id" ]; then
+                    log warn "local cmd deactivate: missing peer_id"
+                    continue
+                fi
+                local deact_pubkey=""
+                deact_pubkey="$(cache_get_str "$peer_id" "public_key")"
+                if [ -z "$deact_pubkey" ]; then
+                    log warn "local cmd deactivate: unknown peer_id=$peer_id (not in cache)"
+                    continue
+                fi
+                deactivate_peer "$peer_id" "$deact_pubkey" "local-request" || true
+                ;;
+            reload)
+                log info "local cmd reload: reloading config"
+                config_reload || true
+                ;;
+            *)
+                [ -z "$cmd" ] || log warn "local cmd: unknown command cmd=$cmd"
+                ;;
+        esac
+    done
+
+    exec 4>&-
+}
+
 # Function: cleanup
 # Purpose: Stop background loops and release cache lock on process exit.
 # Inputs: Uses stored background PIDs and lock path globals.
@@ -1812,9 +1896,14 @@ cleanup() {
     if [ -n "$PID_SYNC" ]; then
         kill "$PID_SYNC" 2>/dev/null || true
     fi
+    if [ -n "$PID_CMD" ]; then
+        kill "$PID_CMD" 2>/dev/null || true
+    fi
 
     rm -f "$BINDING_CACHE_FILE" 2>/dev/null || true
     rm -f "$CONTROL_PID_FILE" 2>/dev/null || true
+    rm -f "$CMD_FIFO_FILE" 2>/dev/null || true
+    rm -f "$MAIN_PID_FILE" 2>/dev/null || true
     cache_unlock
 }
 
@@ -1848,6 +1937,9 @@ main() {
 
     cache_init
     BINDING_CACHE_FILE="/tmp/wpcp-${WG_INTERFACE}-bindings"
+    MAIN_PID_FILE="/tmp/wpcp-${WG_INTERFACE}-main.pid"
+    CMD_FIFO_FILE="/tmp/wpcp-${WG_INTERFACE}-cmd.fifo"
+    printf '%s\n' "$$" > "$MAIN_PID_FILE"
     ensure_local_peer_record
 
     if [ -n "$CONFIG_FILE" ]; then
@@ -1872,6 +1964,9 @@ main() {
     peer_sync_loop &
     PID_SYNC="$!"
 
+    local_cmd_loop &
+    PID_CMD="$!"
+
     log info "$APP_NAME started iface=$WG_INTERFACE local_peer_id=$LOCAL_PEER_ID cache=$CACHE_FILE"
 
     while [ "$RUNNING" = "1" ]; do
@@ -1885,6 +1980,12 @@ main() {
             control_and_observation_subscriber_loop &
             PID_CONTROL="$!"
             printf '%s\n' "$PID_CONTROL" > "$CONTROL_PID_FILE"
+        fi
+
+        if ! kill -0 "$PID_CMD" 2>/dev/null; then
+            log warn "local cmd loop exited, restarting"
+            local_cmd_loop &
+            PID_CMD="$!"
         fi
 
         sleep 5
